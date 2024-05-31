@@ -138,6 +138,12 @@ pub(crate) struct BuildKitArgs {
     #[arg(long, env = "BUILDSYS_KITS_DIR")]
     pub(crate) kits_dir: PathBuf,
 
+    #[arg(long, env = "BUILDSYS_VERSION_BUILD")]
+    pub(crate) version_build: String,
+
+    #[arg(long, env = "BUILDSYS_VERSION_IMAGE")]
+    pub(crate) version_image: String,
+
     #[command(flatten)]
     pub(crate) common: Common,
 }

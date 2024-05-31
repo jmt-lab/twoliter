@@ -148,6 +148,8 @@ impl KitBuildArgs {
         args.push("none".into());
         args.build_arg("KIT", &self.kit);
         args.build_arg("PACKAGE_DEPENDENCIES", self.package_dependencies.join(" "));
+        args.build_arg("BUILD_ID", &self.version_build);
+        args.build_arg("VERSION_ID", &self.version_id);
         args
     }
 }
@@ -155,6 +157,8 @@ impl KitBuildArgs {
 struct KitBuildArgs {
     kit: String,
     package_dependencies: Vec<String>,
+    version_build: String,
+    version_id: String,
 }
 
 impl crate::builder::PackageBuildArgs {
@@ -388,6 +392,8 @@ impl DockerBuild {
             target_build_args: TargetBuildArgs::Kit(KitBuildArgs {
                 kit: kit.to_string(),
                 package_dependencies: manifest.package_dependencies().context(error::GraphSnafu)?,
+                version_build: args.version_build,
+                version_id: args.version_image,
             }),
             secrets_args: Vec::new(),
         })

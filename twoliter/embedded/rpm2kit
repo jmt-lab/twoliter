@@ -38,7 +38,7 @@ dnf --disablerepo '*' --repofrompath "kit,file:///${KIT_DIR}" repoquery --all
 
 WORK_DIR="$(mktemp -d)"
 TIMESTAMP="$(date +"%FT%T.%NZ")"
-FILENAME_PREFIX="${KIT_NAME:?}-${ARCH:?}-${VERSION_ID:?}-${BUILD_ID:?}"
+FILENAME_PREFIX="${KIT:?}-${ARCH:?}-${VERSION_ID:?}-${BUILD_ID:?}"
 
 # Create the content layer
 mkdir -p "${WORK_DIR}/blobs/sha256"
