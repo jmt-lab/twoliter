@@ -63,10 +63,14 @@ fn main() {
         "Unable to write to file '{}'",
         paths.tar_gz.display()
     ));
+
+    packwolf::pack(Path::new("packwolf.toml"), &paths.gen_dir).expect("packwolf failure");
     println!("Done at {:?}", SystemTime::now());
 }
 
 struct Paths {
+    /// Generative dir
+    gen_dir: PathBuf,
     /// The directory where our scripts, Makefile.toml etc. are located.
     data_input_dir: PathBuf,
     /// The directory that we will copy everything to before creating a tarball.
@@ -83,6 +87,7 @@ impl Paths {
             PathBuf::from(env::var("OUT_DIR").expect("The cargo variable 'OUT_DIR' is missing"));
 
         Self {
+            gen_dir: out_dir.clone(),
             data_input_dir: PathBuf::from(DATA_INPUT_DIR),
             prep_dir: out_dir.join("tools"),
             tar_gz: out_dir.join("tools.tar.gz"),

@@ -1,0 +1,86 @@
+[embed.tools]
+extract-to = "."
+
+[embed.tools.source.files]
+"Makefile.toml" = "Makefile.toml"
+"build.Dockerfile" = "build.Dockerfile"
+"build.Dockerfile.dockerignore" = "build.Dockerfile.dockerignore"
+"docker-go" = "docker-go"
+"img2img" = "img2img"
+"imghelper" = "imghelper"
+"partyplanner" = "partyplanner"
+"rpm2img" = "rpm2img"
+"rpm2kit" = "rpm2kit"
+"rpm2kmodkit" = "rpm2kmodkit"
+"rpm2migrations" = "rpm2migrations"
+"metadata.spec" = "metadata.spec"
+"ocihelper" = "ocihelper"
+"waves/accelerated-waves.toml" = "waves/accelerated-waves.toml"
+"waves/default-waves.toml" = "waves/default-waves.toml"
+"waves/ohno.toml" = "waves/ohno.toml"
+"waves/slow-roll.toml" = "waves/slow-roll.toml"
+
+
+[embed.bottlerocket-variant]
+extract-to = "."
+
+[embed.bottlerocket-variant.source]
+workspace = ".."
+package = "buildsys"
+binary = "bottlerocket-variant"
+
+[embed.buildsys]
+extract-to = "."
+
+[embed.buildsys.source]
+workspace = ".."
+package = "buildsys"
+binary = "buildsys"
+
+[embed.pipesys]
+extract-to = "."
+
+[embed.pipesys.source]
+workspace = ".."
+package = "pipesys"
+binary = "pipesys"
+
+[embed.pubsys]
+extract-to = "."
+
+[embed.pubsys.source]
+workspace = ".."
+package = "pubsys"
+binary = "pubsys"
+
+[embed.pubsys-setup]
+extract-to = "."
+
+[embed.pubsys-setup.source]
+workspace = ".."
+package = "pubsys-setup"
+binary = "pubsys-setup"
+
+[embed.testsys]
+extract-to = "."
+
+[embed.testsys.source]
+workspace = ".."
+package = "testsys"
+binary = "testsys"
+
+[embed.unplug]
+extract-to = "."
+
+[embed.unplug.source]
+workspace = ".."
+package = "unplug"
+binary = "unplug"
+
+[embed.tuftool]
+extract-to = "."
+
+[embed.tuftool.source]
+name = "tuftool"
+binary = "tuftool"
+version = "0.10"

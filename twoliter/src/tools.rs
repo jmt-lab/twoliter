@@ -9,16 +9,18 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::runtime::Handle;
 
-const TAR_GZ_DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tools.tar.gz"));
-const BOTTLEROCKET_VARIANT: &[u8] =
-    include_bytes!(env!("CARGO_BIN_FILE_BUILDSYS_bottlerocket-variant"));
-const BUILDSYS: &[u8] = include_bytes!(env!("CARGO_BIN_FILE_BUILDSYS"));
-const PIPESYS: &[u8] = include_bytes!(env!("CARGO_BIN_FILE_PIPESYS"));
-const PUBSYS: &[u8] = include_bytes!(env!("CARGO_BIN_FILE_PUBSYS"));
-const PUBSYS_SETUP: &[u8] = include_bytes!(env!("CARGO_BIN_FILE_PUBSYS_SETUP"));
-const TESTSYS: &[u8] = include_bytes!(env!("CARGO_BIN_FILE_TESTSYS"));
-const TUFTOOL: &[u8] = include_bytes!(env!("CARGO_BIN_FILE_TUFTOOL"));
-const UNPLUG: &[u8] = include_bytes!(env!("CARGO_BIN_FILE_UNPLUG"));
+include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
+
+//const TAR_GZ_DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tools.tar.gz"));
+//const BOTTLEROCKET_VARIANT: &[u8] =
+//include_bytes!(env!("CARGO_BIN_FILE_BUILDSYS_bottlerocket-variant"));
+// const BUILDSYS: &[u8] = include_bytes!(env!("CARGO_BIN_FILE_BUILDSYS"));
+// const PIPESYS: &[u8] = include_bytes!(env!("CARGO_BIN_FILE_PIPESYS"));
+// const PUBSYS: &[u8] = include_bytes!(env!("CARGO_BIN_FILE_PUBSYS"));
+// const PUBSYS_SETUP: &[u8] = include_bytes!(env!("CARGO_BIN_FILE_PUBSYS_SETUP"));
+// const TESTSYS: &[u8] = include_bytes!(env!("CARGO_BIN_FILE_TESTSYS"));
+//const TUFTOOL: &[u8] = include_bytes!(env!("CARGO_BIN_FILE_TUFTOOL"));
+// const UNPLUG: &[u8] = include_bytes!(env!("CARGO_BIN_FILE_UNPLUG"));
 
 /// Install tools into the given `tools_dir`. If you use a `TempDir` object, make sure to pass it by
 /// reference and hold on to it until you no longer need the tools to still be installed (it will
@@ -34,24 +36,31 @@ pub(crate) async fn install_tools(tools_dir: impl AsRef<Path>) -> Result<()> {
         .context("Unable to create directory for tools")?;
 
     // Write out the embedded tools and scripts.
-    unpack_tarball(dir)
-        .await
-        .context("Unable to install tools")?;
+    TOOLS.extract(dir).context("Unable to install tools")?;
+    // unpack_tarball(dir)
+    //     .await
+    //     .context("Unable to install tools")?;
 
     // Pick one of the embedded files for use as the canonical mtime.
-    let metadata = fs::metadata(dir.join("build.Dockerfile"))
-        .await
-        .context("Unable to get Dockerfile metadata")?;
-    let mtime = FileTime::from_last_modification_time(&metadata);
+    // let metadata = fs::metadata(dir.join("build.Dockerfile"))
+    //     .await
+    //     .context("Unable to get Dockerfile metadata")?;
+    // let mtime = FileTime::from_last_modification_time(&metadata);
 
-    write_bin("bottlerocket-variant", BOTTLEROCKET_VARIANT, &dir, mtime).await?;
-    write_bin("buildsys", BUILDSYS, &dir, mtime).await?;
-    write_bin("pipesys", PIPESYS, &dir, mtime).await?;
-    write_bin("pubsys", PUBSYS, &dir, mtime).await?;
-    write_bin("pubsys-setup", PUBSYS_SETUP, &dir, mtime).await?;
-    write_bin("testsys", TESTSYS, &dir, mtime).await?;
-    write_bin("tuftool", TUFTOOL, &dir, mtime).await?;
-    write_bin("unplug", UNPLUG, &dir, mtime).await?;
+    BOTTLEROCKET_VARIANT.extract(&dir)?;
+    PIPESYS.extract(&dir)?;
+    PUBSYS.extract(&dir)?;
+    PUBSYS_SETUP.extract(&dir)?;
+    TESTSYS.extract(&dir)?;
+    TUFTOOL.extract(&dir)?;
+    //write_bin("bottlerocket-variant", BOTTLEROCKET_VARIANT, &dir, mtime).await?;
+    //write_bin("buildsys", BUILDSYS, &dir, mtime).await?;
+    //write_bin("pipesys", PIPESYS, &dir, mtime).await?;
+    //write_bin("pubsys", PUBSYS, &dir, mtime).await?;
+    //write_bin("pubsys-setup", PUBSYS_SETUP, &dir, mtime).await?;
+    //write_bin("testsys", TESTSYS, &dir, mtime).await?;
+    //write_bin("tuftool", TUFTOOL, &dir, mtime).await?;
+    //write_bin("unplug", UNPLUG, &dir, mtime).await?;
 
     // Apply the mtime to the directory now that the writes are done.
     set_file_mtime(dir, mtime).context(format!("Unable to set mtime for '{}'", dir.display()))?;

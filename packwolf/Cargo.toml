@@ -1,0 +1,18 @@
+[package]
+name = "packwolf"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+sealed = ["dep:pentacle"]
+
+[dependencies]
+glob = "0.3"
+pentacle = { version = "1.0", optional = true }
+serde = { version = "1", features = ["derive"] }
+snafu = "0.8"
+tar = "0.4"
+tempfile = "3.12"
+toml = "0.8"
+zstd = "0.13"

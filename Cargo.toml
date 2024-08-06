@@ -2,6 +2,7 @@
 resolver = "2"
 
 members = [
+    "packwolf",
     "tools/bottlerocket-variant",
     "tools/buildsys",
     "tools/buildsys-config",
