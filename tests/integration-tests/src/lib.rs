@@ -2,7 +2,7 @@
 
 use std::ffi::OsStr;
 use std::path::PathBuf;
-use tokio::process::Command;
+use std::process::Command;
 
 mod twoliter_update;
 
@@ -14,7 +14,7 @@ pub fn test_projects_dir() -> PathBuf {
     p.join("projects")
 }
 
-pub async fn run_command<I, S, E>(cmd: S, args: I, env: E) -> std::process::Output
+pub fn run_command<I, S, E>(cmd: S, args: I, env: E) -> std::process::Output
 where
     I: IntoIterator<Item = S>,
     E: IntoIterator<Item = (S, S)>,
@@ -35,7 +35,6 @@ where
         .args(args.into_iter())
         .envs(env.into_iter())
         .output()
-        .await
         .expect("failed to execute process");
 
     println!("stdout: {}", String::from_utf8_lossy(&output.stdout));

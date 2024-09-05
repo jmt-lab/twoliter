@@ -6,7 +6,7 @@ publish = false
 build = "../build.rs"
 
 [package.metadata.build-kit]
-vendor = "bottlerocket"
+vendor = "primary"
 
 [lib]
 path = "../kit.rs"

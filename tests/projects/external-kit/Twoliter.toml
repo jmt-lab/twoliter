@@ -4,10 +4,10 @@ release-version = "1.0.0"
 [vendor.bottlerocket]
 registry = "public.ecr.aws/bottlerocket"
 
-[vendor.custom-vendor]
-registry = "public.ecr.aws/bottlerocket"
+[vendor.primary]
+registry = "localhost:5000"
 
 [[kit]]
-name = "bottlerocket-core-kit"
-version = "2.0.0"
-vendor = "custom-vendor"
+name = "extra-3-kit"
+version = "1.0.0"
+vendor = "primary"
