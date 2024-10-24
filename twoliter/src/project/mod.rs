@@ -344,6 +344,10 @@ impl ProjectImage {
         self.vendor.vendor_name()
     }
 
+    pub(crate) fn path_override(&self) -> Option<&String> {
+        self.vendor.path_override()
+    }
+
     /// Returns the URI for the original vendor.
     pub(crate) fn original_source_uri(&self) -> ImageUri {
         match &self.vendor {

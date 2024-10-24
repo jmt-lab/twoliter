@@ -1,4 +1,5 @@
 use super::archive::OCIArchive;
+use super::oci::OCI;
 use super::views::ManifestListView;
 use crate::common::fs::create_dir_all;
 use crate::compatibility::SUPPORTED_KIT_METADATA_VERSION;
@@ -191,6 +192,7 @@ impl Debug for EncodedKitMetadata {
 #[derive(Debug)]
 pub struct ImageResolver {
     image: ProjectImage,
+    oci: OCI,
     skip_metadata_retrieval: bool,
 }
 
@@ -198,6 +200,11 @@ impl ImageResolver {
     pub(crate) fn from_image(image: &ProjectImage) -> Result<Self> {
         Ok(Self {
             image: image.clone(),
+            oci: if let Some(path) = image.path_override() {
+                OCI::from_path(path)
+            } else {
+                OCI::from_uri(&image.project_image_uri())
+            },
             skip_metadata_retrieval: false,
         })
     }
@@ -216,6 +223,9 @@ impl ImageResolver {
     )]
     /// Calculate the digest of the locked image
     async fn calculate_digest(&self, image_tool: &ImageTool) -> Result<String> {
+        let manifest_list = self.oci.get_manifest(image_tool).await?;
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest_list)
+            .context("failed to serialize manifest list")?;
         let image_uri = self.image.project_image_uri();
         let image_uri_str = image_uri.to_string();
         let manifest_bytes = image_tool.get_manifest(image_uri_str.as_str()).await?;

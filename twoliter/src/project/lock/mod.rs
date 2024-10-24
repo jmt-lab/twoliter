@@ -7,6 +7,8 @@
 mod archive;
 /// Covers resolution and validation of a single image dependency in a lock file
 mod image;
+/// Provides interactions with an OCI image
+mod oci;
 /// Provides tools for marking artifacts as having been verified against the Twoliter lockfile
 mod verification;
 /// Implements view models of common OCI manifest and configuration types
@@ -45,6 +47,7 @@ struct ExternalKitMetadata {
 #[serde(rename_all = "kebab-case")]
 pub(crate) struct Override {
     pub name: Option<String>,
+    pub path: Option<String>,
     pub registry: Option<String>,
 }
 

@@ -4,7 +4,7 @@
 //! been overridden in a `Twoliter.override` file.
 use super::{Override, ValidIdentifier, VendedArtifact, Vendor};
 use crate::docker::ImageUri;
-use std::fmt::Debug;
+use std::{fmt::Debug, path::PathBuf};
 
 /// `ArtifactVendor` represents a vendor associated with an image artifact used in a project.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -42,6 +42,13 @@ impl ArtifactVendor {
         match self {
             ArtifactVendor::Verbatim(vendor) => &vendor.vendor_name,
             ArtifactVendor::Overridden(vendor) => &vendor.original_vendor_name,
+        }
+    }
+
+    pub(crate) fn path_override(&self) -> Option<&String> {
+        match self {
+            ArtifactVendor::Verbatim(vendor) => None,
+            ArtifactVendor::Overridden(vendor) => vendor.override_.path.as_ref(),
         }
     }
 

@@ -2,16 +2,85 @@ use super::views::{IndexView, ManifestLayoutView};
 use crate::common::fs::{create_dir_all, read, read_to_string, remove_dir_all, write};
 use anyhow::{Context, Result};
 use oci_cli_wrapper::ImageTool;
+use sha2::{Digest, Sha256};
+use tokio::fs::File;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use tar::Archive as TarArchive;
 use tracing::{debug, instrument, trace};
 
 #[derive(Debug)]
+pub(crate) enum OCIArchiveSource {
+    Remote {
+        registry: String,
+        repository: String,
+        digest: String,
+    },
+    Local {
+        path: PathBuf,
+        digest: Option<String>,
+    },
+}
+
+impl OCIArchiveSource {
+    pub(crate) async fn digest(&mut self) -> Result<String> {
+        match self {
+            Self::Remote { .., digest } => Ok(digest.clone()),
+            Self::Local { path, digest } => {
+                if let Some(digest) = digest {
+                    Ok(digest.clone())
+                } else {
+                    let mut hash = Sha256::default();
+                    let mut reader = File::open(path).await.context("failed to open local oci archive for calculating digest")?;
+                    tokio::io::copy(&mut reader, &mut hash).await.context("failed to calculate sha256 hash")?;
+                    let hash_bytes = hash.finalize();
+                    let new_digest = format!("sha256:{}", base16::encode_lower(hash_bytes));
+                    *digest = Some(new_digest);
+                    Ok(new_digest.clone())
+                }
+            }
+        }
+    }
+
+
+    #[instrument(level = "trace", skip_all, fields(registry = %self.registry, repository = %self.repository, digest = %self.digest))]
+    pub async fn pull_image<P>(&self, image_tool: &ImageTool, out: P) -> Result<()>
+    where P: AsRef<Path>, {
+        match self {
+            Self::Remove {
+                registry,
+                repository,
+                digest,
+            } => {
+                let digest_uri = format!("{}/{}@{}", registry, repository, digest);
+                debug!("Pulling image '{}'", digest_uri);
+                let oci_archive_path = out.as_ref();
+                if !oci_archive_path.exists() {
+                    create_dir_all(oci_archive_path).await?;
+                    image_tool
+                        .pull_oci_image(oci_archive_path, digest_uri.as_str())
+                        .await?;
+                } else {
+                    debug!(
+                        "Image from '{}' already present -- no need to pull.",
+                        digest_uri
+                    );
+                }
+            }
+            Self::Local { path, .. } => {
+                let mut reader = std::fs::File::open(path).context("failed to open oci archive")?;
+                let mut archive = TarArchive::new(&mut reader);
+                archive.unpack(out).context("failed to unpack oci archive")?;
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct OCIArchive {
-    registry: String,
-    repository: String,
-    digest: String,
+    source: OCIArchiveSource,
     cache_dir: PathBuf,
 }
 
@@ -21,38 +90,33 @@ impl OCIArchive {
         P: AsRef<Path>,
     {
         Ok(Self {
-            registry: registry.into(),
-            repository: repository.into(),
-            digest: digest.into(),
+            source: OCIArchiveSource::Remote {
+                registry: registry.into(),
+                repository: repository.into(),
+                digest: digest.into(),
+            },
             cache_dir: cache_dir.as_ref().to_path_buf(),
         })
     }
 
-    pub fn archive_path(&self) -> PathBuf {
-        self.cache_dir.join(self.digest.replace(':', "-"))
+    pub fn open<P>(path: P, cache_dir: P) -> Result<self>
+    where
+        P: AsRef<Path>,
+    {
+        Ok(Self {
+            source: OCIArchiveSource::Local { path: path.as_ref().to_path_buf(), digest: None },
+            cache_dir: cache_dir.as_ref().to_path_buf(),
+        })
     }
 
-    pub fn uri(&self) -> String {
-        format!("{}/{}@{}", self.registry, self.repository, self.digest)
+    pub async fn archive_path(&self) -> Result<PathBuf> {
+        Ok(self.cache_dir.join(self.source.digest().await?.replace(':', "-")))
     }
 
     #[instrument(level = "trace", skip_all, fields(registry = %self.registry, repository = %self.repository, digest = %self.digest))]
     pub async fn pull_image(&self, image_tool: &ImageTool) -> Result<()> {
-        let digest_uri = self.uri();
-        debug!("Pulling image '{}'", digest_uri);
-        let oci_archive_path = self.archive_path();
-        if !oci_archive_path.exists() {
-            create_dir_all(&oci_archive_path).await?;
-            image_tool
-                .pull_oci_image(oci_archive_path.as_path(), digest_uri.as_str())
-                .await?;
-        } else {
-            debug!(
-                "Image from '{}' already present -- no need to pull.",
-                digest_uri
-            );
-        }
-        Ok(())
+        let oci_archive_path = self.archive_path().await?;
+        self.source.pull_image(image_tool, &oci_archive_path).await
     }
 
     #[instrument(
