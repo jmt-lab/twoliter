@@ -7,6 +7,7 @@ the repository's top-level Dockerfile.
 pub(crate) mod error;
 
 use crate::args::{BuildKitArgs, BuildPackageArgs, BuildVariantArgs, RepackVariantArgs};
+use buildsys::runtime::{ContainerRuntime, BuildArgs as RuntimeBuildArgs, RunArgs, VolumeMount};
 use bottlerocket_variant::Variant;
 use buildsys::manifest::{
     ExternalKitMetadataView, ImageFeature, ImageFormat, ImageLayout, Manifest, PartitionPlan,
@@ -14,100 +15,19 @@ use buildsys::manifest::{
 };
 use buildsys::BuildType;
 use buildsys_config::EXTERNAL_KIT_METADATA;
-use duct::cmd;
 use error::Result;
 use lazy_static::lazy_static;
-use nonzero_ext::nonzero;
 use pipesys::server::Server as PipesysServer;
-use rand::Rng;
-use regex::Regex;
-use semver::{Comparator, Op, Prerelease, Version, VersionReq};
+
 use sha2::{Digest, Sha512};
-use snafu::{ensure, OptionExt, ResultExt};
+use snafu::{OptionExt, ResultExt};
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, read_dir, File};
-use std::num::NonZeroU16;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::sync::Arc;
 use walkdir::{DirEntry, WalkDir};
-
-/*
-There's a bug in BuildKit that can lead to a build failure during parallel
-`docker build` executions:
-   https://github.com/moby/buildkit/issues/1090
-
-Unfortunately we can't do much to control the concurrency here, and even when
-the bug is fixed there will be many older versions of Docker in the wild.
-
-The failure has an exit code of 1, which is too generic to be helpful. All we
-can do is check the output for the error's signature, and retry if we find it.
-*/
-lazy_static! {
-    static ref DOCKER_BUILD_FRONTEND_ERROR: Regex = Regex::new(concat!(
-        r#"failed to solve with frontend dockerfile.v0: "#,
-        r#"failed to solve with frontend gateway.v0: "#,
-        r#"frontend grpc server closed unexpectedly"#
-    ))
-    .unwrap();
-}
-
-/*
-There's a similar bug that's fixed in new releases of BuildKit but still in the wild in popular
-versions of Docker/BuildKit:
-   https://github.com/moby/buildkit/issues/1468
-*/
-lazy_static! {
-    static ref DOCKER_BUILD_DEAD_RECORD_ERROR: Regex = Regex::new(concat!(
-        r#"failed to solve with frontend dockerfile.v0: "#,
-        r#"failed to solve with frontend gateway.v0: "#,
-        r#"rpc error: code = Unknown desc = failed to build LLB: "#,
-        r#"failed to get dead record"#,
-    ))
-    .unwrap();
-}
-
-/*
-We also see sporadic CI failures with only this error message.
-We use (?m) for multi-line mode so we can match the message on a line of its own without splitting
-the output ourselves; we match the regexes against the whole of stdout.
-*/
-lazy_static! {
-    static ref UNEXPECTED_EOF_ERROR: Regex = Regex::new("(?m)unexpected EOF$").unwrap();
-}
-
-/*
-Sometimes new RPMs are not fully written to the host directory before another build starts, which
-exposes `createrepo_c` to partially-written RPMs that cannot be added to the repo metadata. Retry
-these errors by restarting the build since the alternatives are to ignore the `createrepo_c` exit
-code (masking other problems) or aggressively `sync()` the host directory (hurting performance).
-*/
-lazy_static! {
-    static ref CREATEREPO_C_READ_HEADER_ERROR: Regex = Regex::new(&regex::escape(
-        r#"C_CREATEREPOLIB: Warning: read_header: rpmReadPackageFile() error"#
-    ))
-    .unwrap();
-}
-
-/*
-Twoliter relies on minimum Dockerfile syntax 1.4.3, which is shipped in Docker 23.0.0 by default
-We do not use explicit `syntax=` directives to avoid network connections during the build.
-*/
-lazy_static! {
-    static ref MINIMUM_DOCKER_VERSION: VersionReq = VersionReq {
-        comparators: [Comparator {
-            op: Op::GreaterEq,
-            major: 23,
-            minor: None,
-            patch: None,
-            pre: Prerelease::default(),
-        }]
-        .into()
-    };
-}
-
-static DOCKER_BUILD_MAX_ATTEMPTS: NonZeroU16 = nonzero!(10u16);
 
 // Expected UID for privileged and unprivileged processes inside the build container.
 const ROOT_UID: u32 = 0;
@@ -137,24 +57,28 @@ impl CommonBuildArgs {
         sdk: String,
         arch: SupportedArch,
         cleanup: OutputCleanup,
-    ) -> Self {
+    ) -> Result<Self> {
         let token = token(&root);
 
         // Avoid using a cached layer from a previous build.
-        let nocache = rand::rng().random::<u128>().to_string();
+        let nocache = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context(error::SystemTimeBeforeEpochSnafu)?
+            .as_nanos()
+            .to_string();
 
         // Generate a unique address for the socket that sends the output directory file
         // descriptor.
         let output_socket = format!("buildsys-output-{token}-{nocache}");
 
-        Self {
+        Ok(Self {
             arch,
             sdk,
             nocache,
             token,
             cleanup,
             output_socket,
-        }
+        })
     }
 }
 
@@ -343,11 +267,12 @@ pub(crate) struct DockerBuild {
     common_build_args: CommonBuildArgs,
     target_build_args: TargetBuildArgs,
     secrets_args: Vec<String>,
+    runtime: Arc<dyn ContainerRuntime>,
 }
 
 impl DockerBuild {
     /// Create a new `DockerBuild` that can build a package.
-    pub(crate) fn new_package(args: BuildPackageArgs, manifest: &Manifest) -> Result<Self> {
+    pub(crate) fn new_package(args: BuildPackageArgs, manifest: &Manifest, runtime: Arc<dyn ContainerRuntime>) -> Result<Self> {
         let package = manifest.info().package_name();
         let per_package_dir = format!("{}/{}", args.packages_dir.display(), package).into();
         let old_package_dir = format!("{}", args.packages_dir.display()).into();
@@ -373,7 +298,7 @@ impl DockerBuild {
                 args.common.sdk_image,
                 args.common.arch,
                 OutputCleanup::BeforeBuild,
-            ),
+            )?,
             target_build_args: TargetBuildArgs::Package(PackageBuildArgs {
                 package: package.to_string(),
                 package_dependencies: manifest.package_dependencies().context(error::GraphSnafu)?,
@@ -385,10 +310,11 @@ impl DockerBuild {
                 version_build_timestamp: args.version_build_timestamp,
             }),
             secrets_args: Vec::new(),
+            runtime,
         })
     }
 
-    pub(crate) fn new_kit(args: BuildKitArgs, manifest: &Manifest) -> Result<Self> {
+    pub(crate) fn new_kit(args: BuildKitArgs, manifest: &Manifest, runtime: Arc<dyn ContainerRuntime>) -> Result<Self> {
         let kit = manifest.info().kit_name();
         let per_kit_dir = args.kits_dir.join(kit);
 
@@ -413,7 +339,7 @@ impl DockerBuild {
                 args.common.sdk_image,
                 args.common.arch,
                 OutputCleanup::BeforeBuild,
-            ),
+            )?,
             target_build_args: TargetBuildArgs::Kit(KitBuildArgs {
                 kit: kit.to_string(),
                 vendor: manifest.info().kit_vendor().context(error::GraphSnafu)?,
@@ -424,11 +350,12 @@ impl DockerBuild {
                 version_id: args.version_image,
             }),
             secrets_args: Vec::new(),
+            runtime,
         })
     }
 
     /// Create a new `DockerBuild` that can build a variant image.
-    pub(crate) fn new_variant(args: BuildVariantArgs, manifest: &Manifest) -> Result<Self> {
+    pub(crate) fn new_variant(args: BuildVariantArgs, manifest: &Manifest, runtime: Arc<dyn ContainerRuntime>) -> Result<Self> {
         let image_layout = manifest.info().image_layout().cloned().unwrap_or_default();
         let ImageLayout {
             os_image_size_gib,
@@ -469,7 +396,7 @@ impl DockerBuild {
                 args.common.sdk_image,
                 args.common.arch,
                 OutputCleanup::BeforeBuild,
-            ),
+            )?,
             target_build_args: TargetBuildArgs::Variant(VariantBuildArgs {
                 package_dependencies: manifest.package_dependencies().context(error::GraphSnafu)?,
                 kit_dependencies: manifest.kit_dependencies().context(error::GraphSnafu)?,
@@ -514,11 +441,12 @@ impl DockerBuild {
                 version_image: args.version_image,
             }),
             secrets_args: secrets_args()?,
+            runtime,
         })
     }
 
     /// Create a new `DockerBuild` that can repackage a variant image.
-    pub(crate) fn repack_variant(args: RepackVariantArgs, manifest: &Manifest) -> Result<Self> {
+    pub(crate) fn repack_variant(args: RepackVariantArgs, manifest: &Manifest, runtime: Arc<dyn ContainerRuntime>) -> Result<Self> {
         let image_layout = manifest.info().image_layout().cloned().unwrap_or_default();
         let ImageLayout {
             os_image_size_gib,
@@ -551,7 +479,7 @@ impl DockerBuild {
                 args.common.sdk_image,
                 args.common.arch,
                 OutputCleanup::None,
-            ),
+            )?,
             target_build_args: TargetBuildArgs::Repack(RepackVariantBuildArgs {
                 data_image_publish_size_gib,
                 data_image_size_gib: data_image_size_gib.to_string(),
@@ -575,11 +503,12 @@ impl DockerBuild {
                 version_image: args.version_image,
             }),
             secrets_args: secrets_args()?,
+            runtime,
         })
     }
 
     pub(crate) fn build(&self) -> Result<()> {
-        check_docker_version()?;
+        self.runtime.check_version().context(error::RuntimeSnafu)?;
 
         env::set_current_dir(&self.root_dir).context(error::DirectoryChangeSnafu {
             path: &self.root_dir,
@@ -601,98 +530,78 @@ impl DockerBuild {
             OutputCleanup::None => (),
         }
 
-        let mut build = format!(
-            "build {context} \
-            --target {target} \
-            --tag {tag} \
-            --network host \
-            --file {dockerfile} \
-            --no-cache-filter rpmbuild,kitbuild,repobuild,imgbuild,migrationbuild,kmodkitbuild,imgrepack \
-            --build-arg BYPASS_SOCKET={tag}-bypass \
-            --build-arg BUILDER_UID={uid}",
-            context = self.context.display(),
-            dockerfile = self.dockerfile.display(),
-            target = self.target,
-            tag = self.tag,
-            uid = *BUILDER_UID,
-        )
-        .split_string();
+        let bypass_name = format!("{}-bypass", self.tag);
 
-        build.extend(self.build_args());
-        build.extend(self.secrets_args.clone());
+        // Clean up the previous image if it exists.
+        let _ = self.runtime.remove_image(&self.tag);
+
+        // Clean up the stopped bypass container if it exists.
+        let _ = self.runtime.remove_container(&bypass_name);
 
         // Run a container with the project's root as a read-only volume mount, so that pipesys can
         // serve a read-only file descriptor that's safe to pass into builds.
-        let run_bypass = format!(
-            "run \
-            --name {tag}-bypass \
-            --rm \
-            --detach \
-            --init \
-            --net host \
-            --pid host \
-            -u {uid} \
-            -v {root}:/bypass:ro \
-            -v {root}/build/tools/pipesys:/usr/local/bin/pipesys:ro \
-            {sdk} \
-            pipesys serve --socket {tag}-bypass --client-uid {uid} --path /bypass",
-            tag = self.tag,
-            root = self.root_dir.display(),
-            sdk = self.common_build_args.sdk,
-            uid = ROOT_UID,
-        )
-        .split_string();
-
-        let rm_image = format!("rmi --force {}", self.tag).split_string();
-        let rm_bypass = format!("rm --force {}-bypass", self.tag).split_string();
-
-        // Clean up the previous image if it exists.
-        let _ = docker(&rm_image, Retry::No);
-
-        // Clean up the stopped bypass container if it exists.
-        let _ = docker(&rm_bypass, Retry::No);
+        let bypass_args = RunArgs {
+            image: self.common_build_args.sdk.clone(),
+            name: bypass_name.clone(),
+            volumes: vec![
+                VolumeMount { host: self.root_dir.display().to_string(), container: "/bypass".into(), readonly: true },
+                VolumeMount { host: format!("{}/build/tools/pipesys", self.root_dir.display()), container: "/usr/local/bin/pipesys".into(), readonly: true },
+            ],
+            user: Some(ROOT_UID.to_string()),
+            detach: true,
+            rm: true,
+            init: true,
+            net: Some("host".into()),
+            pid: Some("host".into()),
+            command: vec!["pipesys".into(), "serve".into(), "--socket".into(), bypass_name.clone(), "--client-uid".into(), ROOT_UID.to_string(), "--path".into(), "/bypass".into()],
+        };
 
         // Start the bypass container that will serve the project root file
         // descriptor.
-        docker(&run_bypass, Retry::No)?;
+        self.runtime.run(&bypass_args).context(error::RuntimeSnafu)?;
 
-        let runtime = tokio::runtime::Runtime::new().context(error::AsyncRuntimeSnafu)?;
+        let tokio_runtime = tokio::runtime::Runtime::new().context(error::AsyncRuntimeSnafu)?;
 
         // Spawn a background task to share the file descriptors for the output directory.
         let output_socket = self.common_build_args.output_socket.clone();
         let output_dir = marker_dir.clone();
-        runtime.spawn(async move {
+        tokio_runtime.spawn(async move {
             PipesysServer::for_path(output_socket, ROOT_UID, &output_dir)
                 .serve()
                 .await
         });
 
         // Build the image, which builds the artifacts we want.
-        // Work around transient, known failure cases with Docker.
-        let build_result = docker(
-            &build,
-            Retry::Yes {
-                attempts: DOCKER_BUILD_MAX_ATTEMPTS,
-                messages: &[
-                    &*DOCKER_BUILD_FRONTEND_ERROR,
-                    &*DOCKER_BUILD_DEAD_RECORD_ERROR,
-                    &*UNEXPECTED_EOF_ERROR,
-                    &*CREATEREPO_C_READ_HEADER_ERROR,
-                ],
-            },
-        );
+        let mut build_args_vec = self.build_args();
+        build_args_vec.push("--build-arg".into());
+        build_args_vec.push(format!("BYPASS_SOCKET={}", bypass_name));
+        build_args_vec.push("--build-arg".into());
+        build_args_vec.push(format!("BUILDER_UID={}", *BUILDER_UID));
+
+        let runtime_build_args = RuntimeBuildArgs {
+            context: self.context.display().to_string(),
+            dockerfile: self.dockerfile.display().to_string(),
+            target: self.target.clone(),
+            tag: self.tag.clone(),
+            build_args: build_args_vec,
+            secrets_args: self.secrets_args.clone(),
+            no_cache_filter: vec!["rpmbuild".into(), "kitbuild".into(), "repobuild".into(), "imgbuild".into(), "migrationbuild".into(), "kmodkitbuild".into(), "imgrepack".into()],
+            network: "host".into(),
+        };
+
+        let build_result = self.runtime.build(&runtime_build_args);
 
         // Clean up our bypass container.
-        let _ = docker(&rm_bypass, Retry::No);
+        let _ = self.runtime.remove_container(&bypass_name);
 
         // Stop the runtime and the background threads.
-        runtime.shutdown_background();
+        tokio_runtime.shutdown_background();
 
         // Check whether the build succeeded before continuing.
-        build_result?;
+        build_result.context(error::RuntimeSnafu)?;
 
         // Clean up our image now that we're done.
-        docker(&rm_image, Retry::No)?;
+        self.runtime.remove_image(&self.tag).context(error::RuntimeSnafu)?;
 
         // Copy artifacts to the expected directory and write markers to track them.
         copy_build_files(&marker_dir, &self.artifacts_dirs[0])?;
@@ -724,83 +633,6 @@ impl DockerBuild {
 
         args
     }
-}
-
-// =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=
-
-/// Run `docker` with the specified arguments.
-fn docker(args: &[String], retry: Retry) -> Result<Output> {
-    let mut max_attempts: u16 = 1;
-    let mut retry_messages: &[&Regex] = &[];
-    if let Retry::Yes { attempts, messages } = retry {
-        max_attempts = attempts.into();
-        retry_messages = messages;
-    }
-
-    let mut attempt = 1;
-    loop {
-        let output = cmd("docker", args)
-            .stderr_to_stdout()
-            .stdout_capture()
-            .unchecked()
-            .run()
-            .context(error::CommandStartSnafu)?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        println!("{}", &stdout);
-        if output.status.success() {
-            return Ok(output);
-        }
-
-        ensure!(
-            retry_messages.iter().any(|m| m.is_match(&stdout)) && attempt < max_attempts,
-            error::DockerExecutionSnafu {
-                args: &args.join(" ")
-            }
-        );
-
-        attempt += 1;
-    }
-}
-
-/// Allow the caller to configure retry behavior, since the command may fail
-/// for spurious reasons that should not be treated as an error.
-enum Retry<'a> {
-    No,
-    Yes {
-        attempts: NonZeroU16,
-        messages: &'a [&'static Regex],
-    },
-}
-
-// =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=
-
-pub fn docker_server_version() -> Result<Version> {
-    let docker_version_out = cmd("docker", ["version", "--format", "{{.Server.Version}}"])
-        .stderr_to_stdout()
-        .stdout_capture()
-        .unchecked()
-        .run()
-        .context(error::CommandStartSnafu)?;
-    let version_str = String::from_utf8_lossy(&docker_version_out.stdout)
-        .trim()
-        .to_string();
-
-    Version::parse(&version_str).context(error::VersionParseSnafu { version_str })
-}
-
-fn check_docker_version() -> Result<()> {
-    let docker_version = docker_server_version()?;
-
-    snafu::ensure!(
-        MINIMUM_DOCKER_VERSION.matches(&docker_version),
-        error::DockerVersionRequirementSnafu {
-            installed_version: docker_version,
-            required_version: MINIMUM_DOCKER_VERSION.clone()
-        }
-    );
-
-    Ok(())
 }
 
 // =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=   =^..^=
@@ -1085,23 +917,6 @@ impl BuildSecret for Vec<String> {
             id.as_ref(),
             src.as_ref()
         ));
-    }
-}
-
-/// Helper trait for splitting a string on spaces into owned Strings.
-///
-/// If you need an element with internal spaces, you should handle that separately, for example
-/// with BuildArg.
-trait SplitString {
-    fn split_string(&self) -> Vec<String>;
-}
-
-impl<S> SplitString for S
-where
-    S: AsRef<str>,
-{
-    fn split_string(&self) -> Vec<String> {
-        self.as_ref().split(' ').map(String::from).collect()
     }
 }
 

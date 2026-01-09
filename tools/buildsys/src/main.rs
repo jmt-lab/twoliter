@@ -13,12 +13,16 @@ mod builder;
 mod cache;
 mod gomod;
 mod project;
+mod script_builder;
 mod spec;
 
 use crate::args::{
     BuildKitArgs, BuildPackageArgs, BuildVariantArgs, Buildsys, Command, RepackVariantArgs,
 };
 use crate::builder::DockerBuild;
+use crate::script_builder::ScriptBuilder;
+use buildsys::runtime::{detect_runtime, RuntimePreference};
+
 use buildsys::manifest::{BundleModule, Manifest, ManifestInfo, SupportedArch};
 use buildsys_config::EXTERNAL_KIT_METADATA;
 use cache::LookasideCache;
@@ -66,6 +70,11 @@ mod error {
             source: super::builder::error::Error,
         },
 
+        #[snafu(display("{source}"))]
+        ScriptBuildAttempt {
+            source: super::script_builder::error::Error,
+        },
+
         #[snafu(display("Unable to instantiate the builder: {source}"))]
         BuilderInstantiation {
             source: crate::builder::error::Error,
@@ -90,6 +99,9 @@ mod error {
         path.display(),
         ))]
         VariantSensitive { name: String, path: PathBuf },
+
+        #[snafu(display("Failed to detect container runtime: {source}"))]
+        RuntimeDetection { source: buildsys::runtime::Error },
     }
 }
 
@@ -113,6 +125,19 @@ fn run(args: Buildsys) -> Result<()> {
         Command::BuildKit(args) => build_kit(*args),
         Command::BuildVariant(args) => build_variant(*args),
         Command::RepackVariant(args) => repack_variant(*args),
+    }
+}
+
+/// Parses a string into a RuntimePreference.
+///
+/// Recognized values (case-insensitive): "docker", "finch", "podman", "auto".
+/// Unrecognized values default to Auto.
+fn parse_runtime_preference(s: &str) -> RuntimePreference {
+    match s.to_lowercase().as_str() {
+        "docker" => RuntimePreference::Docker,
+        "finch" => RuntimePreference::Finch,
+        "podman" => RuntimePreference::Podman,
+        _ => RuntimePreference::Auto,
     }
 }
 
@@ -201,7 +226,15 @@ fn build_package(args: BuildPackageArgs) -> Result<()> {
         return Ok(());
     }
 
-    DockerBuild::new_package(args, &manifest)
+    let preference = parse_runtime_preference(&args.common.runtime);
+    let runtime = detect_runtime(preference).context(error::RuntimeDetectionSnafu)?;
+
+    if std::env::var("TWOLITER_BUILD_MODE").as_deref() == Ok("script") {
+        return ScriptBuilder::build_package(args, &manifest, runtime)
+            .context(error::ScriptBuildAttemptSnafu);
+    }
+
+    DockerBuild::new_package(args, &manifest, runtime)
         .context(error::BuilderInstantiationSnafu)?
         .build()
         .context(error::BuildAttemptSnafu)
@@ -225,7 +258,15 @@ fn build_kit(args: BuildKitArgs) -> Result<()> {
         return Ok(());
     }
 
-    DockerBuild::new_kit(args, &manifest)
+    let preference = parse_runtime_preference(&args.common.runtime);
+    let runtime = detect_runtime(preference).context(error::RuntimeDetectionSnafu)?;
+
+    if std::env::var("TWOLITER_BUILD_MODE").as_deref() == Ok("script") {
+        return ScriptBuilder::build_kit(args, &manifest, runtime)
+            .context(error::ScriptBuildAttemptSnafu);
+    }
+
+    DockerBuild::new_kit(args, &manifest, runtime)
         .context(error::BuilderInstantiationSnafu)?
         .build()
         .context(error::BuildAttemptSnafu)
@@ -251,7 +292,15 @@ fn build_variant(args: BuildVariantArgs) -> Result<()> {
         return Ok(());
     }
 
-    DockerBuild::new_variant(args, &manifest)
+    let preference = parse_runtime_preference(&args.common.runtime);
+    let runtime = detect_runtime(preference).context(error::RuntimeDetectionSnafu)?;
+
+    if std::env::var("TWOLITER_BUILD_MODE").as_deref() == Ok("script") {
+        return ScriptBuilder::build_variant(args, &manifest, runtime)
+            .context(error::ScriptBuildAttemptSnafu);
+    }
+
+    DockerBuild::new_variant(args, &manifest, runtime)
         .context(error::BuilderInstantiationSnafu)?
         .build()
         .context(error::BuildAttemptSnafu)
@@ -272,7 +321,15 @@ fn repack_variant(args: RepackVariantArgs) -> Result<()> {
         return Ok(());
     }
 
-    DockerBuild::repack_variant(args, &manifest)
+    let preference = parse_runtime_preference(&args.common.runtime);
+    let runtime = detect_runtime(preference).context(error::RuntimeDetectionSnafu)?;
+
+    if std::env::var("TWOLITER_BUILD_MODE").as_deref() == Ok("script") {
+        return ScriptBuilder::repack_variant(args, &manifest, runtime)
+            .context(error::ScriptBuildAttemptSnafu);
+    }
+
+    DockerBuild::repack_variant(args, &manifest, runtime)
         .context(error::BuilderInstantiationSnafu)?
         .build()
         .context(error::BuildAttemptSnafu)

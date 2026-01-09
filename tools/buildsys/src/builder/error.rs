@@ -16,21 +16,8 @@ pub(crate) enum Error {
     #[snafu(display("Failed to read repo root '{}'", root_json_path.display()))]
     BadRootJson { root_json_path: PathBuf },
 
-    #[snafu(display("Failed to start command: {}", source))]
-    CommandStart { source: std::io::Error },
-
-    #[snafu(display("Failed to execute command: 'docker {}'", args))]
-    DockerExecution { args: String },
-
-    #[snafu(display(
-        "The installed docker ('{}') does not meet the minimum version requirement ('{}')",
-        installed_version,
-        required_version
-    ))]
-    DockerVersionRequirement {
-        installed_version: semver::Version,
-        required_version: semver::VersionReq,
-    },
+    #[snafu(display("Container runtime error: {}", source))]
+    Runtime { source: buildsys::runtime::Error },
 
     #[snafu(display("Failed to change directory to '{}': {}", path.display(), source))]
     DirectoryChange {
@@ -102,11 +89,8 @@ pub(crate) enum Error {
         source: bottlerocket_variant::error::Error,
     },
 
-    #[snafu(display("Failed to parse version string '{version_str}': {source}"))]
-    VersionParse {
-        source: semver::Error,
-        version_str: String,
-    },
+    #[snafu(display("System clock is before Unix epoch, cannot generate timestamp"))]
+    SystemTimeBeforeEpoch { source: std::time::SystemTimeError },
 }
 
 pub(super) type Result<T> = std::result::Result<T, Error>;

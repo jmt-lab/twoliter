@@ -15,21 +15,30 @@ use url::Url;
 /// variable changes. The build type is represented with bit flags so that we can easily list
 /// multiple build types for a single variable. See `[BuildType]` and `[rerun_for_envs]` below to
 /// see how this list is used.
-const REBUILD_VARS: [(&str, u8); 14] = [
+///
+/// Notable additions:
+/// - BUILDSYS_KITS_DIR, BUILDSYS_PACKAGES_DIR: Path changes affect where artifacts are found
+/// - TWOLITER_RUNTIME: Different container runtimes may produce different build artifacts
+/// - TWOLITER_BUILD_MODE: Build mode affects optimization and debug settings
+/// - BUILDSYS_VARIANT: Triggers VARIANT rebuilds when the target variant changes
+const REBUILD_VARS: [(&str, u8); 17] = [
     ("BUILDSYS_ARCH", PACKAGE | KIT | VARIANT),
     ("BUILDSYS_CACERTS_BUNDLE_OVERRIDE", VARIANT),
-    ("BUILDSYS_KITS_DIR", KIT),
+    ("BUILDSYS_KITS_DIR", KIT | VARIANT),
     ("BUILDSYS_EXTERNAL_KITS_DIR", PACKAGE | KIT | VARIANT),
     ("BUILDSYS_NAME", VARIANT),
     ("BUILDSYS_IMAGES_DIR", VARIANT),
     ("BUILDSYS_OUTPUT_GENERATION_ID", PACKAGE | KIT | VARIANT),
-    ("BUILDSYS_PACKAGES_DIR", PACKAGE),
+    ("BUILDSYS_PACKAGES_DIR", PACKAGE | VARIANT),
     ("BUILDSYS_PRETTY_NAME", VARIANT),
     ("BUILDSYS_ROOT_DIR", PACKAGE | KIT | VARIANT),
     ("BUILDSYS_STATE_DIR", PACKAGE | KIT | VARIANT),
     ("BUILDSYS_VERSION_BUILD", KIT | VARIANT),
     ("BUILDSYS_VERSION_IMAGE", KIT | VARIANT),
     ("TLPRIVATE_SDK_IMAGE", PACKAGE | KIT | VARIANT),
+    ("TWOLITER_RUNTIME", PACKAGE | KIT | VARIANT),
+    ("TWOLITER_BUILD_MODE", PACKAGE | KIT | VARIANT),
+    ("BUILDSYS_VARIANT", VARIANT),
 ];
 
 /// A tool for building Bottlerocket images and artifacts.
@@ -84,6 +93,11 @@ pub(crate) struct Common {
 
     #[arg(long, env = "TWOLITER_TOOLS_DIR")]
     pub(crate) tools_dir: PathBuf,
+
+    /// Container runtime selection: "docker", "finch", "podman", or "auto".
+    /// Defaults to "auto" which tries docker, finch, then podman in order.
+    #[arg(long, env = "TWOLITER_RUNTIME", default_value = "auto")]
+    pub(crate) runtime: String,
 
     /// cicd_hack is used to suppress builds from running after all the cargo-related metadata is
     /// emitted. This allows cargo to create a fresh crate, and assumes that the corresponding
@@ -169,6 +183,15 @@ pub(crate) struct BuildVariantArgs {
 
     #[arg(long, env = "BUILDSYS_IMAGES_DIR")]
     pub(crate) image_dir: PathBuf,
+
+    #[arg(long, env = "BUILDSYS_PACKAGES_DIR")]
+    pub(crate) packages_dir: PathBuf,
+
+    #[arg(long, env = "BUILDSYS_KITS_DIR")]
+    pub(crate) kits_dir: PathBuf,
+
+    #[arg(long, env = "BUILDSYS_EXTERNAL_KITS_DIR")]
+    pub(crate) external_kits_dir: PathBuf,
 
     #[command(flatten)]
     pub(crate) common: Common,
