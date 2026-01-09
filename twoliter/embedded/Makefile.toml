@@ -111,6 +111,7 @@ GO_MOD_CACHE = "${BUILDSYS_ROOT_DIR}/.gomodcache/pkg/mod"
 GO_MODULES = ""
 
 DOCKER_BUILDKIT = "1"
+TWOLITER_RUNTIME = "docker"
 
 # This is the filename suffix for operations that write out AMI information to
 # file.  It can be overridden with -e in situations where a user is using
@@ -300,7 +301,7 @@ mkdir -p ${GO_MOD_CACHE}
 dependencies = ["setup"]
 script = [
 '''
-for cmd in docker gzip lz4; do
+for cmd in ${TWOLITER_RUNTIME} gzip lz4; do
   if ! command -v ${cmd} >/dev/null 2>&1 ; then
     echo "required program '${cmd}' not found" >&2
     exit 1
@@ -328,7 +329,14 @@ cleanup() {
 
 trap 'cleanup' EXIT
 
-SDK_PLATFORM="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')"
+# Set SDK_PLATFORM: default (docker), then override for podman/finch
+SDK_PLATFORM="$(${TWOLITER_RUNTIME} version --format '{{.Server.Os}}/{{.Server.Arch}}')"
+[ "${TWOLITER_RUNTIME}" = "podman" ] && SDK_PLATFORM="$(${TWOLITER_RUNTIME} version --format '{{.Client.OsArch}}')"
+[ "${TWOLITER_RUNTIME}" = "finch" ] && SDK_PLATFORM="$(${TWOLITER_RUNTIME} info --format '{{.OSType}}/{{.Architecture}}' | sed 's/aarch64/arm64/')"
+if [ -z "${SDK_PLATFORM}" ]; then
+  echo "Failed to detect SDK platform from ${TWOLITER_RUNTIME}" >&2
+  exit 1
+fi
 KRANE="${TWOLITER_TOOLS_DIR}/krane"
 
 mkdir -p "${BUILDSYS_EXTERNAL_SDKS_DIR}"
@@ -339,15 +347,15 @@ if [ ! -s "${BUILDSYS_EXTERNAL_KITS_DIR}/.sdk-verified" ]; then
    exit 1
 fi
 
-if ! docker image inspect "${TLPRIVATE_SDK_IMAGE}" >/dev/null 2>&1 ; then
+if ! ${TWOLITER_RUNTIME} image inspect "${TLPRIVATE_SDK_IMAGE}" >/dev/null 2>&1 ; then
   echo "Pulling SDK '${TLPRIVATE_SDK_IMAGE}'"
   if ! ${KRANE} pull "${TLPRIVATE_SDK_IMAGE}" "${SDK_ARCHIVE_PATH}" --platform "${SDK_PLATFORM}" ; then
     echo "failed to pull '${TLPRIVATE_SDK_IMAGE}'" >&2
     exit 1
   fi
 
-  if ! docker load --input "${SDK_ARCHIVE_PATH}" ; then
-    echo "failed to load '${TLPRIVATE_SDK_IMAGE}' into docker daemon" >&2
+  if ! ${TWOLITER_RUNTIME} load --input "${SDK_ARCHIVE_PATH}" ; then
+    echo "failed to load '${TLPRIVATE_SDK_IMAGE}' into container runtime" >&2
     exit 1
   fi
 fi
@@ -403,7 +411,7 @@ script = [
 go_fetch() {
   local module
   module="${1:?}"
-  GO_CMD=$(docker run --rm ${TLPRIVATE_SDK_IMAGE} bash -c "go-latest version" >/dev/null 2>&1 \
+  GO_CMD=$(${TWOLITER_RUNTIME} run --rm ${TLPRIVATE_SDK_IMAGE} bash -c "go-latest version" >/dev/null 2>&1 \
          && echo "go-latest" || echo "go")
   ${TWOLITER_TOOLS_DIR}/docker-go \
     --module-path "${BUILDSYS_SOURCES_DIR}/${module}" \
@@ -481,7 +489,7 @@ for m in ${GO_MODULES}; do
 done
 
 # For rust first-party source code
-if ! docker run --rm \
+if ! ${TWOLITER_RUNTIME} run --rm \
    -u $(id -u):$(id -g) \
    -e CARGO_HOME="/tmp/.cargo" \
    -v "${CARGO_HOME}/twoliter_cargo_config.toml":/tmp/.cargo/config.toml \
@@ -518,7 +526,7 @@ rc=0
 export VARIANT="${BUILDSYS_VARIANT}"
 
 # For rust first-party source code
-if ! docker run --rm \
+if ! ${TWOLITER_RUNTIME} run --rm \
    -u $(id -u):$(id -g) \
    -e CARGO_HOME="/tmp/.cargo" \
    -v "${CARGO_HOME}/twoliter_cargo_config.toml":/tmp/.cargo/config.toml \
@@ -545,7 +553,7 @@ script = [
 rc=0
 
 # For bash first-party shell code
-if ! docker run --rm \
+if ! ${TWOLITER_RUNTIME} run --rm \
   --network=none \
   --user "$(id -u):$(id -g)" \
   --security-opt="label=disable" \
@@ -586,7 +594,7 @@ config_path="${top_path}/.golangci.yaml"
 for m in ${GO_MODULES}; do
     cd "sources/${m}"
     mod_name=$(pwd)
-    docker run --rm \
+    ${TWOLITER_RUNTIME} run --rm \
         -v "${mod_name}":/"${mod_name}" \
         -v "${config_path}":/"${config_path}" \
         -w /"${mod_name}" \
@@ -835,7 +843,7 @@ else
    boot_config="${boot_config_tmp}"
 fi
 
-docker run --rm \
+${TWOLITER_RUNTIME} run --rm \
    --network=none \
    --user "$(id -u):$(id -g)" \
    --security-opt="label=disable" \
@@ -856,7 +864,7 @@ dependencies = ["fetch-sdk"]
 script_runner = "bash"
 script = [
 '''
-docker run --rm \
+${TWOLITER_RUNTIME} run --rm \
    --network=none \
    --user "$(id -u):$(id -g)" \
    --security-opt="label=disable" \
@@ -1063,7 +1071,7 @@ run_cargo_deny="
 (cd /tmp/sources && cargo deny --all-features check --disable-fetch licenses bans sources)
 "
 set +e
-docker run --rm \
+${TWOLITER_RUNTIME} run --rm \
   --network=none \
   --user "$(id -u):$(id -g)" \
   --security-opt="label=disable" \

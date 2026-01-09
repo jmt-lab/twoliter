@@ -157,6 +157,7 @@ fn build_system_env_vars() -> Result<Vec<String>> {
 const ENV_VARS: &[&str] = &[
     "ALLOW_MISSING_KEY",
     "AMI_DATA_FILE_SUFFIX",
+    "TWOLITER_RUNTIME",
     "CARGO_MAKE_CARGO_ARGS",
     "CARGO_MAKE_CARGO_LIMIT_JOBS",
     "CARGO_MAKE_DEFAULT_TESTSYS_KUBECONFIG_PATH",
@@ -194,6 +195,7 @@ fn is_build_system_env(key: impl AsRef<str>) -> bool {
         || key.starts_with("PUBLISH_")
         || key.starts_with("REPO_")
         || key.starts_with("TESTSYS_")
+        || key.starts_with("TWOLITER_")
         || key.starts_with("BOOT_CONFIG")
         || key.starts_with("AWS_")
         || ENV_VARS.contains(&key)
@@ -220,6 +222,7 @@ fn test_is_build_system_env() {
     assert!(is_build_system_env("GOPROXY"));
     assert!(is_build_system_env("http_proxy"));
     assert!(is_build_system_env("AWS_REGION"));
+    assert!(is_build_system_env("TWOLITER_RUNTIME"));
 
     // not
     assert!(!is_build_system_env("PATH"));

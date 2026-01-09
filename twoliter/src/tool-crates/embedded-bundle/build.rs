@@ -41,6 +41,11 @@ fn main() {
     paths.copy_file("waves/default-waves.toml");
     paths.copy_file("waves/ohno.toml");
     paths.copy_file("waves/slow-roll.toml");
+    paths.copy_file("scripts/common.sh");
+    paths.copy_file("scripts/package-build.sh");
+    paths.copy_file("scripts/kit-build.sh");
+    paths.copy_file("scripts/variant-build.sh");
+    paths.copy_file("scripts/repack-build.sh");
 
     // Create tarball in memory.
     println!("Starting tarball creation at {:?}", SystemTime::now());

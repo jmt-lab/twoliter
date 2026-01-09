@@ -22,7 +22,7 @@ VERITY_HASH_ALGORITHM=sha256
 VERITY_DATA_BLOCK_SIZE=4096
 VERITY_HASH_BLOCK_SIZE=4096
 
-SBKEYS="${HOME}/sbkeys"
+SBKEYS="${SBKEYS:-${HOME}/sbkeys}"
 
 # Pre-emptively declare global arrays to be populated later.
 declare -a SHIM_SIGN_KEY CODE_SIGN_KEY
@@ -31,7 +31,10 @@ sanity_checks() {
   local output_fmt partition_plan ovf_template uefi_secure_boot sbom_package_dir
   output_fmt="${1:?}"
   partition_plan="${2:?}"
-  ovf_template="${3:?}"
+  # ovf_template is optional: only required when output_fmt is "vmdk".
+  # For raw/qcow2 formats, no OVF is needed. The vmdk case below validates
+  # that the template exists and matches the partition plan when provided.
+  ovf_template="${3:-}"
   uefi_secure_boot="${4:?}"
   sbom_package_dir="${5:-}"
 
