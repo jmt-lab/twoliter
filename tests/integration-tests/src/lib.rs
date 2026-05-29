@@ -8,6 +8,8 @@ use tempfile::TempDir;
 
 mod advisory_checker;
 mod appinventory;
+mod guest_images_build;
+mod guest_images_helper;
 mod imghelper;
 mod twoliter_build;
 mod twoliter_update;
