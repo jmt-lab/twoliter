@@ -306,11 +306,20 @@ fn repack_variant(args: RepackVariantArgs) -> Result<()> {
     check_arch_support(manifest.info(), args.common.arch);
     validate_standalone_image_or_warn(manifest.info())?;
 
+    // Resolve declared guest-images. On a repack of a host variant, the
+    // imgrepack stage passes these install paths through to `img2img` so
+    // it can find and resign every `*.eif` under each install path before
+    // rebuilding host verity. For an EIF-format variant (which has no
+    // guests inside its own rootfs) the list is empty.
+    let guest_images = manifest
+        .guest_image_variant_deps()
+        .context(error::ManifestParseSnafu)?;
+
     if args.common.cicd_hack {
         return Ok(());
     }
 
-    DockerBuild::repack_variant(args, &manifest)
+    DockerBuild::repack_variant(args, &manifest, guest_images)
         .context(error::BuilderInstantiationSnafu)?
         .build()
         .context(error::BuildAttemptSnafu)
