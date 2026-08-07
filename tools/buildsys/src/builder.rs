@@ -9,8 +9,8 @@ pub(crate) mod error;
 use crate::args::{BuildKitArgs, BuildPackageArgs, BuildVariantArgs, RepackVariantArgs};
 use bottlerocket_variant::Variant;
 use buildsys::manifest::{
-    resolved_image_layout, validate_image_features, ExternalKitMetadataView, ImageFeature,
-    ImageFormat, Manifest, PartitionPlan, SupportedArch,
+    resolved_image_layout, validate_image_features, EifKernelFormat, ExternalKitMetadataView,
+    ImageFeature, ImageFormat, Manifest, PartitionPlan, SupportedArch,
 };
 use buildsys::BuildType;
 use buildsys_config::EXTERNAL_KIT_METADATA;
@@ -227,6 +227,14 @@ fn format_eif_pcie_flags(flags: Option<u16>) -> String {
     flags.map(|v| format!("{v:x}")).unwrap_or_default()
 }
 
+/// Serialize the variant-authored EIF kernel format for the `EIF_KERNEL_FORMAT`
+/// build-arg. When unset we forward the empty string; the Dockerfile passes
+/// that through unchanged and `rpm2eif` treats an empty value as "apply my
+/// built-in default" (bzImage on x86_64). Non-EIF variants ignore this.
+fn format_eif_kernel_format(fmt: Option<EifKernelFormat>) -> String {
+    fmt.map(|v| v.as_str().to_string()).unwrap_or_default()
+}
+
 struct VariantBuildArgs {
     package_dependencies: Vec<String>,
     kit_dependencies: Vec<String>,
@@ -243,6 +251,13 @@ struct VariantBuildArgs {
     /// field, in which case `rpm2eif` omits `--pcie-flags` and `eif-builder`
     /// applies its own `DEFAULT_PCIE_FLAGS`. Non-EIF variants ignore this.
     eif_pcie_flags: String,
+    /// x86_64 EIF kernel format override from `[package.metadata.build-variant]
+    /// eif-kernel-format`. Forwarded to `rpm2eif` as the `EIF_KERNEL_FORMAT`
+    /// build-arg (`"bzimage"` or `"vmlinux"`). Empty string when unset, in
+    /// which case `rpm2eif` applies its own default (bzImage — the sidecar
+    /// enclave loader's boot protocol). Ignored on aarch64 and by non-EIF
+    /// variants.
+    eif_kernel_format: String,
     name: String,
     os_image_publish_size_gib: String,
     os_image_size_gib: String,
@@ -282,6 +297,7 @@ impl VariantBuildArgs {
         args.build_arg("IMAGE_NAME", &self.name);
         args.build_arg("KERNEL_PARAMETERS", &self.kernel_parameters);
         args.build_arg("EIF_PCIE_FLAGS", &self.eif_pcie_flags);
+        args.build_arg("EIF_KERNEL_FORMAT", &self.eif_kernel_format);
         args.build_arg("KIT_DEPENDENCIES", self.kit_dependencies.join(" "));
         args.build_arg(
             "EXTERNAL_KIT_DEPENDENCIES",
@@ -603,6 +619,9 @@ impl DockerBuild {
                     .unwrap_or_default()
                     .join(" "),
                 eif_pcie_flags: format_eif_pcie_flags(manifest.info().eif_pcie_flags()),
+                eif_kernel_format: format_eif_kernel_format(
+                    manifest.info().eif_kernel_format(),
+                ),
                 name: args.name,
                 os_image_publish_size_gib: os_image_publish_size_gib.to_string(),
                 os_image_size_gib: os_image_size_gib.to_string(),
