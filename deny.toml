@@ -61,6 +61,10 @@ multiple-versions = "deny"
 wildcards = "deny"
 
 skip = [
+    # object has two cause snafu through tough uses old but we need newest for pcrsys
+    { name = "object" },
+    { name = "base64" },
+    { name = "miniz_oxide" },
     # governor and guppy collide bringing two versions of hashbrown and foldhash
     { name = "hashbrown" },
     { name = "foldhash" },
@@ -81,10 +85,7 @@ skip = [
     { name = "digest" },
     { name = "getrandom" },
     { name = "heck" },
-    { name = "http" },
-    { name = "http-body" },
     { name = "r-efi" },
-    { name = "rand_chacha" },
     { name = "rand_core" },
     { name = "sha2" },
     { name = "snafu" },
@@ -92,7 +93,6 @@ skip = [
     { name = "syn" },
     { name = "unicode-width" },
     { name = "untrusted" },
-    { name = "windows-sys" },
     { name = "winnow" },
 ]
 
