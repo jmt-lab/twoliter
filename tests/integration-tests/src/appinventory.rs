@@ -21,14 +21,14 @@ const EXPECTED_INVENTORY_PATH: &str =
 const SOURCE_PACKAGE_INVENTORY_ANCHOR_VERSION: &str = "1.56.0";
 
 #[derive(Serialize, Deserialize)]
-pub struct GithubRelease {
-    tag_name: String,
+pub struct GithubTagInfo {
+    name: String,
 }
 
 async fn find_latest_version(repository: &str) -> String {
     // We make a get request to fetch the github releases of twoliter
     let url = Url::parse(&format!(
-        "https://api.github.com/repos/bottlerocket-os/{repository}/releases/latest"
+        "https://api.github.com/repos/bottlerocket-os/{repository}/tags"
     ))
     .expect("invalid url");
     let client = reqwest::Client::new();
@@ -45,23 +45,14 @@ async fn find_latest_version(repository: &str) -> String {
     let response = request
         .send()
         .await
-        .expect("failed to query github api for release list");
+        .expect("failed to query github api for tag list");
     let response_body = response
         .bytes()
         .await
-        .expect("failed to get response from github api for release list");
-    let release: GithubRelease =
+        .expect("failed to get response from github api for tag list");
+    let info: GithubTagInfo =
         serde_json::from_slice(&response_body).expect("malformed data returned from github api");
-    let tag_name = release.tag_name;
-    let tag_name = tag_name
-        .split_once(" ")
-        .map(|x| x.0)
-        .unwrap_or(tag_name.as_str());
-
-    tag_name
-        .strip_prefix("refs/tags/")
-        .unwrap_or(tag_name)
-        .to_string()
+    release.name
 }
 
 fn parse_version(release: &str) -> Version {
