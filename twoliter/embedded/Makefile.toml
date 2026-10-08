@@ -187,6 +187,8 @@ BOOT_CONFIG = "${BUILDSYS_ROOT_DIR}/bootconfig.data"
 [env.private]
 # The URI for the SDK image must be provided.
 TLPRIVATE_SDK_IMAGE = ""
+# The content-addressed image id of the pinned SDK, used for local docker ops.
+TLPRIVATE_SDK_IMAGE_ID = ""
 
 ####################################################################################################
 
@@ -277,18 +279,43 @@ if [ ! -s "${BUILDSYS_EXTERNAL_KITS_DIR}/.sdk-verified" ]; then
    exit 1
 fi
 
-if ! docker image inspect "${TLPRIVATE_SDK_IMAGE}" >/dev/null 2>&1 ; then
-  echo "Pulling SDK '${TLPRIVATE_SDK_IMAGE}'"
-  if ! ${KRANE} pull "${TLPRIVATE_SDK_IMAGE}" "${SDK_ARCHIVE_PATH}" --platform "${SDK_PLATFORM}" ; then
-    echo "failed to pull '${TLPRIVATE_SDK_IMAGE}'" >&2
-    exit 1
-  fi
-
-  if ! docker load --input "${SDK_ARCHIVE_PATH}" ; then
-    echo "failed to load '${TLPRIVATE_SDK_IMAGE}' into docker daemon" >&2
-    exit 1
-  fi
+if [ -z "${TLPRIVATE_SDK_IMAGE_ID}" ]; then
+   echo "TLPRIVATE_SDK_IMAGE_ID must be set by Twoliter for tasks that use the SDK" >&2
+   exit 1
 fi
+
+if docker image inspect "${TLPRIVATE_SDK_IMAGE_ID}" >/dev/null 2>&1 ; then
+  exit 0
+fi
+
+echo "Pulling SDK '${TLPRIVATE_SDK_IMAGE}'"
+if ! ${KRANE} pull "${TLPRIVATE_SDK_IMAGE}" "${SDK_ARCHIVE_PATH}" --platform "${SDK_PLATFORM}" ; then
+  echo "failed to pull '${TLPRIVATE_SDK_IMAGE}'" >&2
+  exit 1
+fi
+
+# `krane pull` tags digest-sourced tarballs with `:i-was-a-digest`; rewrite
+# `docker load`'s output to show the pinned digest instead.
+SDK_DIGEST="${TLPRIVATE_SDK_IMAGE##*@}"
+docker load --input "${SDK_ARCHIVE_PATH}" \
+  | sed "s|:i-was-a-digest\$|@${SDK_DIGEST}|"
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  echo "failed to load '${TLPRIVATE_SDK_IMAGE}' into docker daemon" >&2
+  exit 1
+fi
+
+# Anti-swap check: the loaded image's content id must match the pinned manifest.
+LOADED_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "${TLPRIVATE_SDK_IMAGE_ID}" 2>/dev/null || true)"
+if [ "${LOADED_IMAGE_ID}" != "${TLPRIVATE_SDK_IMAGE_ID}" ]; then
+  echo "loaded SDK image id does not match pinned manifest" >&2
+  echo "  expected: ${TLPRIVATE_SDK_IMAGE_ID}" >&2
+  echo "  loaded:   ${LOADED_IMAGE_ID:-<missing>}" >&2
+  exit 1
+fi
+
+# Leave the `:i-was-a-digest` tag in place: removing the only RepoTag lets
+# docker GC the image, since its RepoDigests entry (config-digest-keyed) is
+# not treated as a reference-holder.
 '''
 ]
 
@@ -341,11 +368,11 @@ script = [
 go_fetch() {
   local module
   module="${1:?}"
-  GO_CMD=$(docker run --rm ${TLPRIVATE_SDK_IMAGE} bash -c "go-latest version" >/dev/null 2>&1 \
+  GO_CMD=$(docker run --rm ${TLPRIVATE_SDK_IMAGE_ID} bash -c "go-latest version" >/dev/null 2>&1 \
          && echo "go-latest" || echo "go")
   ${TWOLITER_TOOLS_DIR}/docker-go \
     --module-path "${BUILDSYS_SOURCES_DIR}/${module}" \
-    --sdk-image ${TLPRIVATE_SDK_IMAGE} \
+    --sdk-image ${TLPRIVATE_SDK_IMAGE_ID} \
     --go-mod-cache ${GO_MOD_CACHE} \
     --command "
       if [ -f go.work ]; then
@@ -380,7 +407,7 @@ test_go_module() {
   module="${1:?}"
   ${TWOLITER_TOOLS_DIR}/docker-go \
     --module-path "${BUILDSYS_SOURCES_DIR}/${module}" \
-    --sdk-image ${TLPRIVATE_SDK_IMAGE} \
+    --sdk-image ${TLPRIVATE_SDK_IMAGE_ID} \
     --go-mod-cache ${GO_MOD_CACHE} \
     --command "cd cmd/$module; go test -v"
 }
@@ -411,7 +438,7 @@ go_fmt() {
   module="${1:?}"
   ${TWOLITER_TOOLS_DIR}/docker-go \
     --module-path "${BUILDSYS_SOURCES_DIR}/${module}" \
-    --sdk-image ${TLPRIVATE_SDK_IMAGE} \
+    --sdk-image ${TLPRIVATE_SDK_IMAGE_ID} \
     --go-mod-cache ${GO_MOD_CACHE} \
     --command "gofmt -l cmd/$module"
 }
@@ -431,7 +458,7 @@ if ! docker run --rm \
    -v "${CARGO_HOME}/twoliter_cargo_config.toml":/tmp/.cargo/config.toml \
    -v "${CARGO_HOME}/vendor":/tmp/.cargo/vendor \
    -v "${BUILDSYS_ROOT_DIR}/sources":/tmp/sources \
-   "${TLPRIVATE_SDK_IMAGE}" \
+   "${TLPRIVATE_SDK_IMAGE_ID}" \
    cargo fmt \
   --manifest-path /tmp/sources/Cargo.toml \
   --message-format short \
@@ -469,7 +496,7 @@ if ! docker run --rm \
    -v "${CARGO_HOME}/vendor":/tmp/.cargo/vendor \
    -v "${BUILDSYS_ROOT_DIR}/sources":/tmp/sources \
    -e VARIANT \
-   "${TLPRIVATE_SDK_IMAGE}" \
+   "${TLPRIVATE_SDK_IMAGE_ID}" \
    cargo clippy \
   --manifest-path /tmp/sources/Cargo.toml \
   --locked -- -D warnings --no-deps; then
@@ -494,7 +521,7 @@ if ! docker run --rm \
   --user "$(id -u):$(id -g)" \
   --security-opt="label=disable" \
   -v "${BUILDSYS_TOOLS_DIR}":/tmp/tools \
-  "${TLPRIVATE_SDK_IMAGE}" \
+  "${TLPRIVATE_SDK_IMAGE_ID}" \
   bash -c \
     'flagged_scripts=0 && \
     cd /tmp/tools && \
@@ -746,7 +773,7 @@ echo "Generating local keys." >&2
 
 mkdir -p "${BUILDSYS_SBKEYS_PROFILE_DIR}"
 ${BUILDSYS_SBKEYS_DIR}/generate-local-sbkeys \
-  --sdk-image "${TLPRIVATE_SDK_IMAGE}" \
+  --sdk-image "${TLPRIVATE_SDK_IMAGE_ID}" \
   --output-dir "${BUILDSYS_SBKEYS_PROFILE_DIR}"
 '''
 ]
@@ -803,7 +830,7 @@ docker run --rm \
    --security-opt="label=disable" \
    -v "${BOOT_CONFIG_INPUT}":/tmp/bootconfig-input \
    -v "${boot_config}":/tmp/bootconfig.data \
-   "${TLPRIVATE_SDK_IMAGE}" \
+   "${TLPRIVATE_SDK_IMAGE_ID}" \
    bootconfig -a /tmp/bootconfig-input /tmp/bootconfig.data
 
 if [ -e "${boot_config_tmp}" ] ; then
@@ -823,7 +850,7 @@ docker run --rm \
    --user "$(id -u):$(id -g)" \
    --security-opt="label=disable" \
    -v "${BOOT_CONFIG}":/tmp/bootconfig.data \
-   "${TLPRIVATE_SDK_IMAGE}" \
+   "${TLPRIVATE_SDK_IMAGE_ID}" \
    bootconfig -l /tmp/bootconfig.data
 '''
 ]
@@ -1033,7 +1060,7 @@ docker run --rm \
   -v "${CARGO_HOME}/twoliter_cargo_config.toml":/tmp/.cargo/config.toml \
   -v "${CARGO_HOME}/vendor":/tmp/.cargo/vendor \
   -v "${BUILDSYS_ROOT_DIR}/sources":/tmp/sources \
-  "${TLPRIVATE_SDK_IMAGE}" \
+  "${TLPRIVATE_SDK_IMAGE_ID}" \
   bash -c "${run_cargo_deny}"
 [ "${?}" -eq 0 ] || [ "${BUILDSYS_ALLOW_FAILED_LICENSE_CHECK}" = "true" ]
 '''

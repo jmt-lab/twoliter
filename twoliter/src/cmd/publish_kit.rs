@@ -50,9 +50,9 @@ impl PublishKit {
             None => &self.kit_name,
         };
         let image_tool = ImageTool::from_builtin_krane();
-        let sdk_uri = project.sdk_image_uri(&image_tool).await?;
+        let sdk = project.sdk_image_uri(&image_tool).await?;
 
-        CargoMake::new(&sdk_uri)?
+        CargoMake::new(&sdk)?
             .env("TWOLITER_TOOLS_DIR", toolsdir.display().to_string())
             .env("BUILDSYS_KIT", &self.kit_name)
             .env("BUILDSYS_VERSION_IMAGE", project.release_version())

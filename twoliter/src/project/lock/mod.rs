@@ -12,7 +12,7 @@ mod verification;
 /// Implements view models of common OCI manifest and configuration types
 mod views;
 
-pub(crate) use self::image::{build_pinned_uri, LockedImage};
+pub(crate) use self::image::{resolve_pinned_sdk, LockedImage, PinnedSdk};
 pub(crate) use self::verification::VerificationTagger;
 
 use crate::common::fs::{create_dir_all, read, write};

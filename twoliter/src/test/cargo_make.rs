@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use semver::Version;
 use serde::Deserialize;
 
-use crate::project::ValidIdentifier;
+use crate::project::{PinnedSdk, ValidIdentifier};
 use crate::{cargo_make::CargoMake, project::Project, test::data_dir};
 
 #[tokio::test]
@@ -13,9 +13,13 @@ async fn test_cargo_make() {
     let version = Version::new(1, 2, 3);
     let vendor_id = ValidIdentifier("my-vendor".into());
     let registry = "a.com/b";
-    let source = format!("{}/{}:v{}", registry, "my-bottlerocket-sdk", "1.2.3");
+    let sdk = PinnedSdk {
+        pinned_uri: format!("{}/{}:v{}", registry, "my-bottlerocket-sdk", "1.2.3"),
+        image_id: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
+    };
 
-    let cargo_make = CargoMake::new(&source)
+    let cargo_make = CargoMake::new(&sdk)
         .unwrap()
         .makefile(data_dir().join("Makefile.toml"));
     cargo_make.exec("verify-twoliter-env").await.unwrap();

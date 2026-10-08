@@ -30,6 +30,16 @@ pub(crate) struct ManifestLayoutView {
 }
 
 #[derive(Deserialize, Debug)]
+pub(crate) struct ImageManifestView {
+    pub config: Descriptor,
+}
+
+#[derive(Deserialize, Debug)]
+pub(crate) struct Descriptor {
+    pub digest: String,
+}
+
+#[derive(Deserialize, Debug)]
 pub(crate) struct Layer {
     pub digest: ContainerDigest,
 }

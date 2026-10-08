@@ -1,5 +1,5 @@
 use super::archive::OCIArchive;
-use super::views::ManifestListView;
+use super::views::{ImageManifestView, ManifestListView};
 use crate::common::fs::create_dir_all;
 use crate::compatibility::SUPPORTED_KIT_METADATA_VERSION;
 use crate::docker::ImageUri;
@@ -442,20 +442,41 @@ impl ImageResolver {
     }
 }
 
-/// Builds a `registry/repo@sha256:<hex>` reference pinned to the per-arch image digest,
-/// after verifying the manifest list against `expected_lock_digest` from `Twoliter.lock`.
-pub(crate) async fn build_pinned_uri(
+pub(crate) struct PinnedSdk {
+    pub pinned_uri: String,
+    pub image_id: String,
+}
+
+pub(crate) async fn resolve_pinned_sdk(
     image: &ProjectImage,
     image_tool: &ImageTool,
     arch: &str,
     expected_lock_digest: &str,
-) -> Result<String> {
+) -> Result<PinnedSdk> {
     let uri = image.project_image_uri();
     let base = uri_without_tag(&uri)?;
     let arch_digest = ImageResolver::from_image(image)?
         .resolve_arch_digest(image_tool, arch, expected_lock_digest)
         .await?;
-    Ok(format!("{base}@{arch_digest}"))
+    let pinned_uri = format!("{base}@{arch_digest}");
+
+    let manifest_bytes = image_tool
+        .get_manifest(pinned_uri.as_str())
+        .await
+        .with_context(|| format!("failed to fetch per-arch manifest for {pinned_uri}"))?;
+    let manifest: ImageManifestView = serde_json::from_slice(manifest_bytes.as_slice())
+        .with_context(|| format!("failed to deserialize per-arch manifest for {pinned_uri}"))?;
+    validate_oci_digest(&manifest.config.digest).with_context(|| {
+        format!(
+            "per-arch manifest for {pinned_uri} has malformed config digest '{}'",
+            manifest.config.digest
+        )
+    })?;
+
+    Ok(PinnedSdk {
+        pinned_uri,
+        image_id: manifest.config.digest,
+    })
 }
 
 fn uri_without_tag(uri: &ImageUri) -> Result<String> {

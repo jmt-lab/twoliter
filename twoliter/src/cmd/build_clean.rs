@@ -1,5 +1,5 @@
 use crate::cargo_make::CargoMake;
-use crate::project::{self, Locked};
+use crate::project::{self, Locked, PinnedSdk};
 use crate::tools;
 use anyhow::Result;
 use clap::Parser;
@@ -21,9 +21,12 @@ impl BuildClean {
         let makefile_path = toolsdir.join("Makefile.toml");
 
         // `clean` does not run anything inside the SDK, so skip the registry lookup.
-        let sdk_uri = project.sdk_image().project_image_uri().to_string();
+        let sdk = PinnedSdk {
+            pinned_uri: project.sdk_image().project_image_uri().to_string(),
+            image_id: String::new(),
+        };
 
-        CargoMake::new(&sdk_uri)?
+        CargoMake::new(&sdk)?
             .env("TWOLITER_TOOLS_DIR", toolsdir.display().to_string())
             .makefile(makefile_path)
             .project_dir(project.project_dir())

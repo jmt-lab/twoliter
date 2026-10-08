@@ -802,6 +802,10 @@ impl DockerBuild {
 
         // Run a container with the project's root as a read-only volume mount, so that pipesys can
         // serve a read-only file descriptor that's safe to pass into builds.
+        let sdk_image_id = std::env::var("TLPRIVATE_SDK_IMAGE_ID")
+            .context(error::EnvironmentSnafu {
+                var: "TLPRIVATE_SDK_IMAGE_ID",
+            })?;
         let run_bypass = format!(
             "run \
             --name {tag}-bypass \
@@ -817,7 +821,7 @@ impl DockerBuild {
             pipesys serve --socket {tag}-bypass --client-uid {uid} --path /bypass",
             tag = self.tag,
             root = self.root_dir.display(),
-            sdk = self.common_build_args.sdk,
+            sdk = sdk_image_id,
             uid = ROOT_UID,
         )
         .split_string();

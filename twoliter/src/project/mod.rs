@@ -3,10 +3,10 @@ mod migrate;
 pub(crate) mod vendor;
 
 pub(crate) use self::vendor::ArtifactVendor;
-pub(crate) use lock::VerificationTagger;
+pub(crate) use lock::{PinnedSdk, VerificationTagger};
 use path_absolutize::Absolutize;
 
-use self::lock::{build_pinned_uri, Lock, LockedSDK, Override};
+use self::lock::{resolve_pinned_sdk, Lock, LockedSDK, Override};
 use self::migrate::parser::UnvalidatedProject;
 use crate::common::fs::{self, read_to_string};
 use crate::compatibility::LATEST_TWOLITER_PROJECT_SCHEMA_VERSION;
@@ -279,15 +279,15 @@ impl<L: ProjectLock> Project<L> {
     }
 }
 
-/// Returns the SDK image URI pinned to the host-arch image manifest digest.
+/// Returns the SDK image pinned to the host-arch manifest digest.
 ///
 /// The SDK runs on the host, so we always pin to the host arch, not `--arch`.
 async fn sdk_image_uri_for(
     sdk_image: &ProjectImage,
     image_tool: &oci_cli_wrapper::ImageTool,
     expected_lock_digest: &str,
-) -> Result<String> {
-    build_pinned_uri(
+) -> Result<PinnedSdk> {
+    resolve_pinned_sdk(
         sdk_image,
         image_tool,
         std::env::consts::ARCH,
@@ -307,7 +307,7 @@ impl Project<SDKLocked> {
     pub(crate) async fn sdk_image_uri(
         &self,
         image_tool: &oci_cli_wrapper::ImageTool,
-    ) -> Result<String> {
+    ) -> Result<PinnedSdk> {
         let SDKLocked(locked) = &self.lock;
         sdk_image_uri_for(&self.sdk_image(), image_tool, &locked.0.digest).await
     }
@@ -340,7 +340,7 @@ impl Project<Locked> {
     pub(crate) async fn sdk_image_uri(
         &self,
         image_tool: &oci_cli_wrapper::ImageTool,
-    ) -> Result<String> {
+    ) -> Result<PinnedSdk> {
         let Locked(lock) = &self.lock;
         sdk_image_uri_for(&self.sdk_image(), image_tool, &lock.sdk.digest).await
     }

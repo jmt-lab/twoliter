@@ -49,9 +49,10 @@ pub struct CargoMake {
 impl CargoMake {
     /// Create a new `cargo make` command. The sdk environment variable will be set based on the
     /// definition in `Twoliter.toml`.
-    pub(crate) fn new(sdk: &str) -> Result<Self> {
+    pub(crate) fn new(sdk: &crate::project::PinnedSdk) -> Result<Self> {
         Ok(Self::default()
-            .env("TLPRIVATE_SDK_IMAGE", sdk)
+            .env("TLPRIVATE_SDK_IMAGE", &sdk.pinned_uri)
+            .env("TLPRIVATE_SDK_IMAGE_ID", &sdk.image_id)
             .env(
                 "BUILDSYS_OUTPUT_GENERATION_ID",
                 BUILDSYS_OUTPUT_GENERATION_ID.to_string(),

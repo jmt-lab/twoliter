@@ -1,6 +1,6 @@
 use super::GlobalOpts;
 use crate::cargo_make::CargoMake;
-use crate::project::{self, Locked, SDKLocked, Unlocked};
+use crate::project::{self, Locked, PinnedSdk, SDKLocked, Unlocked};
 use crate::tools::install_tools;
 use anyhow::Result;
 use clap::Parser;
@@ -56,11 +56,11 @@ pub(crate) struct Make {
 impl Make {
     pub(super) async fn run(&self, global_opts: &GlobalOpts) -> Result<()> {
         let project = project::load_or_find_project(self.project_path.clone()).await?;
-        let sdk_source = self.lock_and_fetch(&project).await?;
+        let sdk = self.lock_and_fetch(&project).await?;
         let toolsdir = project.project_dir().join("build/tools");
         install_tools(&toolsdir).await?;
         let makefile_path = toolsdir.join("Makefile.toml");
-        CargoMake::new(&sdk_source)?
+        CargoMake::new(&sdk)?
             .env("CARGO_HOME", self.cargo_home.display().to_string())
             .env("TWOLITER_TOOLS_DIR", toolsdir.display().to_string())
             .env("BUILDSYS_ARCH", &self.arch)
@@ -80,10 +80,10 @@ impl Make {
         target_allows_kit_verification_skip && project_has_explicit_sdk_dep
     }
 
-    /// Returns the digest-pinned SDK image URI for the project.
+    /// Returns the digest-pinned SDK for the project.
     ///
     /// Fetches kits if needed.
-    async fn lock_and_fetch(&self, project: &project::Project<Unlocked>) -> Result<String> {
+    async fn lock_and_fetch(&self, project: &project::Project<Unlocked>) -> Result<PinnedSdk> {
         let image_tool = ImageTool::from_builtin_krane();
         if self.can_skip_kit_verification(project) {
             project
@@ -226,7 +226,7 @@ mod test {
             .unwrap();
         let project = project.load_lock::<SDKLocked>().await.unwrap();
         let image_tool = ImageTool::from_builtin_krane();
-        let sdk_source = project.sdk_image_uri(&image_tool).await.unwrap();
+        let sdk = project.sdk_image_uri(&image_tool).await.unwrap();
 
         if delete_verifier_tags {
             // Clean up tags so that the build fails
@@ -239,7 +239,7 @@ mod test {
         install_tools(&toolsdir).await.unwrap();
         let makefile_path = toolsdir.join("Makefile.toml");
 
-        CargoMake::new(&sdk_source)
+        CargoMake::new(&sdk)
             .unwrap()
             .env("CARGO_HOME", project_dir.display().to_string())
             .env("TWOLITER_TOOLS_DIR", toolsdir.display().to_string())
