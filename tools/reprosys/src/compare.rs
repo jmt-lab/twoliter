@@ -3,10 +3,12 @@
 use crate::disk::{self, DiskLayout, Partition, Policy, RangeHash};
 use crate::erofs::{self, ErofsTree};
 use crate::error::Result;
+use crate::eventlog;
 use crate::ext4;
 use crate::fsfiles::{self, FileReport, FileStatus, Rules};
 use crate::verity::{self, VerityTable};
 use serde::Serialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use snafu::{ensure_whatever, OptionExt, ResultExt};
 use std::fs::File;
@@ -153,6 +155,18 @@ fn region(
         _ if identical => (Status::Match, "identical"),
         _ => (Status::Mismatch, "contents differ"),
     };
+    let _scope = eventlog::region(name);
+    eventlog::event(
+        "bytes",
+        json!({
+            "policy": policy,
+            "ranges": ranges,
+            "rebuilt_sha256": expected.map(RangeHash::hex),
+            "published_sha256": actual.hex(),
+            "published_all_zero": actual.all_zero,
+            "status": status,
+        }),
+    );
     RegionReport {
         name: name.to_string(),
         policy,
@@ -179,6 +193,16 @@ pub fn compare_os(expected: &Path, actual: &Path) -> Result<ImageReport> {
         actual_len,
         regions: Vec::new(),
     };
+    eventlog::event(
+        "image",
+        json!({
+            "image": "os",
+            "rebuilt": expected,
+            "published": actual,
+            "rebuilt_len": expected_len,
+            "published_len": actual_len,
+        }),
+    );
 
     if actual_len < expected_len {
         report.regions.push(RegionReport {
@@ -199,6 +223,20 @@ pub fn compare_os(expected: &Path, actual: &Path) -> Result<ImageReport> {
     }
 
     let layout = DiskLayout::read(&mut images.expected)?;
+    eventlog::event(
+        "layout",
+        json!({
+            "primary_gpt_end": layout.primary_gpt_end,
+            "backup_gpt": layout.backup_gpt,
+            "partitions": layout.partitions.iter().map(|p| json!({
+                "name": p.name,
+                "offset": p.offset,
+                "len": p.len,
+                "policy": p.policy(),
+            })).collect::<Vec<_>>(),
+            "unallocated": layout.unallocated(expected_len),
+        }),
+    );
     let gpt_ranges = [
         (0, layout.primary_gpt_end),
         (
@@ -246,8 +284,19 @@ pub fn compare_os(expected: &Path, actual: &Path) -> Result<ImageReport> {
                 } else {
                     fsfiles::ext4_files(exp).and_then(|e| Ok((e, fsfiles::ext4_files(act)?)))
                 };
+                let _scope = eventlog::region(&p.name);
                 match files {
                     Ok((exp, act)) => {
+                        let summary = |files: &fsfiles::Files| {
+                            json!({
+                                "files": files.len(),
+                                "bytes": files.values().map(|f| f.len() as u64).sum::<u64>(),
+                            })
+                        };
+                        eventlog::event(
+                            "files-read",
+                            json!({ "rebuilt": summary(&exp), "published": summary(&act) }),
+                        );
                         if p.name == "BOOT-A" {
                             grub_cfgs = (exp.get(GRUB_CFG).cloned(), act.get(GRUB_CFG).cloned());
                         }
@@ -267,6 +316,7 @@ pub fn compare_os(expected: &Path, actual: &Path) -> Result<ImageReport> {
                         }
                     }
                     Err(e) => {
+                        eventlog::event("error", json!({ "error": e.to_string() }));
                         if r.status != Status::Match {
                             r.detail = format!("contents differ and files could not be read: {e}");
                         }
@@ -283,7 +333,11 @@ pub fn compare_os(expected: &Path, actual: &Path) -> Result<ImageReport> {
         .iter()
         .any(|p| p.policy() == Policy::Verity)
     {
+        let _scope = eventlog::region("BOOT-CONFIG");
         let result = check_boot_config(grub_cfgs.0.as_deref(), grub_cfgs.1.as_deref());
+        if let Err(e) = &result {
+            eventlog::event("error", json!({ "error": e.to_string() }));
+        }
         report.regions.push(boot_config_region(
             layout.find("BOOT-A"),
             &grub_cfgs,
@@ -301,6 +355,7 @@ pub fn compare_os(expected: &Path, actual: &Path) -> Result<ImageReport> {
         .iter_mut()
         .filter(|r| r.policy == Policy::Verity)
     {
+        let _scope = eventlog::region(&r.name);
         let Some(table) = &verity_table else {
             r.status = Status::Mismatch;
             r.detail = "verity check failed: the published boot configuration could not be \
@@ -323,6 +378,7 @@ pub fn compare_os(expected: &Path, actual: &Path) -> Result<ImageReport> {
                 );
             }
             Err(e) => {
+                eventlog::event("error", json!({ "error": e.to_string() }));
                 r.status = Status::Mismatch;
                 r.detail = format!("verity check failed: {e}");
             }
@@ -350,8 +406,13 @@ pub fn compare_os(expected: &Path, actual: &Path) -> Result<ImageReport> {
 /// rather than reporting a ROOT-A that was not compared.
 fn compare_root(images: &Images, p: &Partition, r: &mut RegionReport) -> Result<()> {
     let fs_name = |erofs: bool| if erofs { "erofs" } else { "ext4" };
+    let _scope = eventlog::region(&p.name);
     let expected_erofs = erofs::is_erofs(&images.expected, p.offset)?;
     let actual_erofs = erofs::is_erofs(&images.actual, p.offset)?;
+    eventlog::event(
+        "filesystem",
+        json!({ "rebuilt": fs_name(expected_erofs), "published": fs_name(actual_erofs) }),
+    );
     if expected_erofs != actual_erofs {
         r.detail = format!(
             "the rebuilt ROOT-A is {} but the published ROOT-A is {}",
@@ -373,6 +434,14 @@ fn compare_root(images: &Images, p: &Partition, r: &mut RegionReport) -> Result<
             // to any size, so bound the published files by the rebuilt ones first.
             let expected_size = erofs::total_file_size(&images.expected_path, p.offset)?;
             let actual_size = erofs::total_file_size(&images.actual_path, p.offset)?;
+            eventlog::event(
+                "erofs-file-size",
+                json!({
+                    "rebuilt_bytes": expected_size,
+                    "published_bytes": actual_size,
+                    "published_limit": expected_size.saturating_add(p.len),
+                }),
+            );
             ensure_whatever!(
                 actual_size <= expected_size.saturating_add(p.len),
                 "the published ROOT-A holds {actual_size} bytes of files, more than the rebuilt \
@@ -414,6 +483,7 @@ fn compare_root(images: &Images, p: &Partition, r: &mut RegionReport) -> Result<
             r.files = files;
         }
         Err(e) => {
+            eventlog::event("error", json!({ "error": e.to_string() }));
             r.detail = format!("contents differ and files could not be read: {e}");
         }
     }
@@ -436,6 +506,14 @@ fn check_boot_config(expected: Option<&[u8]>, actual: Option<&[u8]>) -> Result<V
         actual.whatever_context("no /grub/grub.cfg could be read from the published BOOT-A")?;
     let same_beyond_verity =
         fsfiles::normalize_verity(expected) == fsfiles::normalize_verity(actual);
+    eventlog::event(
+        "grub-cfg",
+        json!({
+            "rebuilt_sha256": hex::encode(Sha256::digest(expected)),
+            "published_sha256": hex::encode(Sha256::digest(actual)),
+            "same_beyond_verity_digests": same_beyond_verity,
+        }),
+    );
     ensure_whatever!(
         same_beyond_verity,
         "the published grub.cfg differs from the rebuilt grub.cfg beyond the verity root hash and salt"
@@ -451,6 +529,10 @@ fn check_boot_config(expected: Option<&[u8]>, actual: Option<&[u8]>) -> Result<V
     };
     let rebuilt = table(expected, "rebuilt")?;
     let published = table(actual, "published")?;
+    eventlog::event(
+        "verity-tables",
+        json!({ "rebuilt": rebuilt.to_json(), "published": published.to_json() }),
+    );
     ensure_whatever!(
         VerityTable {
             root_hash: rebuilt.root_hash.clone(),
@@ -518,6 +600,16 @@ fn check_verity(images: &mut Images, layout: &DiskLayout, table: &VerityTable) -
         .data_blocks
         .checked_mul(u64::from(table.data_block_size))
         .whatever_context("verity data size overflows")?;
+    eventlog::event(
+        "verity-table",
+        json!({
+            "table": table.to_json(),
+            "hash_device_len": hash_len,
+            "hash_partition_len": hash.len,
+            "data_len": data_len,
+            "root_partition_len": root.len,
+        }),
+    );
     ensure_whatever!(
         data_len <= root.len,
         "verity table covers {data_len} bytes but ROOT-A is {} bytes",
@@ -530,6 +622,13 @@ fn check_verity(images: &mut Images, layout: &DiskLayout, table: &VerityTable) -
         .whatever_context("failed to seek to published ROOT-A")?;
     let mut reader = BufReader::with_capacity(1 << 20, (&images.actual).take(data_len));
     let tree = verity::compute_tree(&mut reader, table)?;
+    eventlog::event(
+        "verity-tree",
+        json!({
+            "computed_root_hash": hex::encode(tree.root_hash),
+            "published_root_hash": hex::encode(&table.root_hash),
+        }),
+    );
     ensure_whatever!(
         tree.root_hash.as_slice() == table.root_hash.as_slice(),
         "root hash of the published ROOT-A ({}) differs from the published root hash ({})",
@@ -540,6 +639,15 @@ fn check_verity(images: &mut Images, layout: &DiskLayout, table: &VerityTable) -
     let published = disk::read_range(&mut images.actual, hash.offset, hash.len)?;
     let uuid = verity::superblock_uuid(&published);
     let device = verity::build_hash_device(table, &tree, uuid, hash.len)?;
+    eventlog::event(
+        "hash-device",
+        json!({
+            "recomputed_len": device.len(),
+            "superblock_uuid": uuid.map(hex::encode),
+            "matches": published[..device.len()] == device[..],
+            "rest_is_zero": published[device.len()..].iter().all(|b| *b == 0),
+        }),
+    );
     ensure_whatever!(
         published[..device.len()] == device[..],
         "published HASH-A differs from the hash tree recomputed over the published ROOT-A"
@@ -563,6 +671,16 @@ pub fn compare_data(expected: &Path, actual: &Path) -> Result<ImageReport> {
         actual_len,
         regions: Vec::new(),
     };
+    eventlog::event(
+        "image",
+        json!({
+            "image": "data",
+            "rebuilt": expected,
+            "published": actual,
+            "rebuilt_len": expected_len,
+            "published_len": actual_len,
+        }),
+    );
     let common = [(0, expected_len.min(actual_len))];
     let (e, a) = images.hash(&common)?;
     let mut r = region("DATA", Policy::MustMatch, &common, Some(&e), &a);
@@ -616,6 +734,26 @@ fn missing_data(expected: Option<&Path>, actual: Option<&Path>) -> Result<ImageR
     })
 }
 
+/// Log the outcome of every region of `report`.
+fn log_results(image: &str, report: &ImageReport) {
+    for r in &report.regions {
+        let _scope = eventlog::region(&r.name);
+        eventlog::event(
+            "result",
+            json!({
+                "image": image,
+                "policy": r.policy,
+                "status": r.status,
+                "fatal": r.fatal,
+                "offset": r.offset,
+                "len": r.len,
+                "detail": r.detail,
+                "listed_files": r.files.len(),
+            }),
+        );
+    }
+}
+
 /// Compare the OS image and the data images. A data image given on only one
 /// side fails verification.
 pub fn compare(
@@ -624,13 +762,42 @@ pub fn compare(
     expected_data: Option<&Path>,
     actual_data: Option<&Path>,
 ) -> Result<Report> {
+    eventlog::event(
+        "start",
+        json!({
+            "rebuilt": expected,
+            "published": actual,
+            "rebuilt_data": expected_data,
+            "published_data": actual_data,
+        }),
+    );
     let os = compare_os(expected, actual)?;
+    log_results("os", &os);
     let data = match (expected_data, actual_data) {
         (Some(e), Some(a)) => Some(compare_data(e, a)?),
         (None, None) => None,
         (e, a) => Some(missing_data(e, a)?),
     };
+    if let Some(data) = &data {
+        log_results("data", data);
+    }
     let failed = os.failed() || data.as_ref().is_some_and(ImageReport::failed);
+    let failed_regions: Vec<String> = std::iter::once(("os", &os))
+        .chain(data.as_ref().map(|d| ("data", d)))
+        .flat_map(|(image, r)| {
+            r.regions
+                .iter()
+                .filter(|r| r.failed())
+                .map(move |r| format!("{image}/{}", r.name))
+        })
+        .collect();
+    eventlog::event(
+        "verdict",
+        json!({
+            "verdict": if failed { Verdict::Failed } else { Verdict::Verified },
+            "failed_regions": failed_regions,
+        }),
+    );
     Ok(Report {
         verdict: if failed {
             Verdict::Failed
@@ -1022,6 +1189,14 @@ mod rootfs_tests {
         root.unwrap()
     }
 
+    fn read_log(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
     fn file<'a>(r: &'a RegionReport, path: &str) -> &'a FileReport {
         r.files.iter().find(|f| f.path == path).unwrap()
     }
@@ -1053,8 +1228,38 @@ mod rootfs_tests {
             signing_key: b"key-two",
             ..DEFAULT
         };
+        let log = d.join("log.jsonl");
+        eventlog::open(&log).unwrap();
         let r = root_a(&rebuilt, &os_image(d, "resigned", erofs, &resigned));
+        eventlog::close().unwrap();
         assert_eq!(r.status, Status::ExpectedDifference, "{r:#?}");
+        // The log has every entry compared, including identical ones, which the report omits.
+        let events = read_log(&log);
+        let entry = |path: &str| {
+            events
+                .iter()
+                .find(|e| e["event"] == "entry" && e["path"] == path)
+                .unwrap_or_else(|| panic!("no entry for {path}"))
+        };
+        let shadow = entry("/etc/shadow");
+        assert_eq!(shadow["region"], "ROOT-A");
+        assert_eq!(shadow["status"], "match");
+        assert_eq!(shadow["published"]["mode"], "0400");
+        assert_eq!(shadow["published"]["xattrs"]["user.small"], "1");
+        assert_eq!(
+            entry("/lib/modules/6.1/kernel/xfs.ko")["status"],
+            "expected-difference"
+        );
+        assert!(events.iter().any(|e| e["event"] == "contents"
+            && e["path"] == "/lib/modules/6.1/kernel/xfs.ko"
+            && e["method"] == "content-aware"));
+        assert!(events
+            .iter()
+            .any(|e| e["event"] == "result" && e["region"] == "ROOT-A"));
+        assert_eq!(events.last().unwrap()["event"], "verdict");
+        if erofs {
+            assert!(events.iter().any(|e| e["event"] == "erofs-listing"));
+        }
         assert_eq!(r.files.len(), 1, "{r:#?}");
         assert_eq!(
             file(&r, "/lib/modules/6.1/kernel/xfs.ko").status,
@@ -1265,7 +1470,19 @@ mod rootfs_tests {
         // A grub.cfg that boots with another root hash fails, even though
         // ROOT-A and HASH-A are byte for byte the rebuilt ones.
         let forged = image("forged", &"a".repeat(64));
+        let log = d.join("log.jsonl");
+        eventlog::open(&log).unwrap();
         let report = compare(&rebuilt, &forged, None, None).unwrap();
+        eventlog::close().unwrap();
+        let events = read_log(&log);
+        let tree = events.iter().find(|e| e["event"] == "verity-tree").unwrap();
+        assert_eq!(tree["region"], "HASH-A");
+        assert_eq!(tree["computed_root_hash"], root_hash);
+        assert_eq!(tree["published_root_hash"], "a".repeat(64));
+        let grub = events
+            .iter()
+            .find(|e| e["event"] == "file" && e["path"] == "/grub/grub.cfg");
+        assert_eq!(grub.unwrap()["region"], "BOOT-A");
         assert_eq!(report.verdict, Verdict::Failed, "{report:#?}");
         assert_eq!(
             region(&report, "BOOT-CONFIG").status,
