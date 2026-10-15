@@ -4,7 +4,7 @@ use crate::error::Result;
 use gptman::GPT;
 use pcrsys::gpt::uuid_to_guid;
 use sha2::{Digest, Sha256};
-use snafu::ResultExt;
+use snafu::{ensure_whatever, ResultExt};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
@@ -29,6 +29,8 @@ pub enum Policy {
     Verity,
     /// Contents depend on signing keys; differences are reported as warnings.
     SigningDependent,
+    /// grub.cfg must match, except for the verity root hash and salt.
+    BootConfig,
 }
 
 /// A partition from the GPT.
@@ -177,6 +179,17 @@ pub fn hash_ranges(file: &mut File, ranges: &[(u64, u64)]) -> Result<RangeHash> 
 #[cfg(test)]
 pub fn hash_range(file: &mut File, offset: u64, len: u64) -> Result<RangeHash> {
     hash_ranges(file, &[(offset, len)])
+}
+
+/// Read `len` bytes at `offset` into memory.
+pub fn read_range(file: &mut File, offset: u64, len: u64) -> Result<Vec<u8>> {
+    ensure_whatever!(len <= 1 << 30, "refusing to read {len} bytes into memory");
+    file.seek(SeekFrom::Start(offset))
+        .whatever_context(format!("failed to seek to {offset}"))?;
+    let mut buf = vec![0u8; len as usize];
+    file.read_exact(&mut buf)
+        .whatever_context(format!("failed to read {len} bytes at {offset}"))?;
+    Ok(buf)
 }
 
 pub fn file_len(file: &File) -> Result<u64> {
