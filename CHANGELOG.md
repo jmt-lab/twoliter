@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+* Add `twoliter verify ami`, which rebuilds the image behind an AMI from source and compares it
+  against the AMI's snapshots, using the new `reprosys` tool. ROOT-A is compared file by file,
+  including extended attributes, when its bytes differ, so that per-build kernel module
+  signatures do not fail verification. erofs root filesystems are compared using erofs-utils. The
+  kernel command line in grub.cfg must match the rebuilt one except for the dm-verity root hash
+  and salt. A detailed JSON Lines log of every comparison step is kept next to the report.
+
 [unreleased]: https://github.com/bottlerocket-os/twoliter/compare/v0.26.0...HEAD
 
 ## [0.26.0] - 2026-10-09
