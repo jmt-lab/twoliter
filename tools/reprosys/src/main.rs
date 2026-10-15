@@ -8,6 +8,7 @@ mod ami;
 mod compare;
 mod disk;
 mod download;
+mod erofs;
 mod error;
 mod ext4;
 mod fsfiles;
@@ -94,7 +95,6 @@ enum Command {
         /// Also write the JSON report to this file
         #[arg(long)]
         report: Option<PathBuf>,
-
     },
 }
 
