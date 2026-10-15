@@ -3,8 +3,10 @@
 //! extraction loses. Long xattr name prefixes and metaboxes are not supported.
 
 use crate::error::Result;
+use crate::eventlog;
 use crate::fsfiles::{self, display, Entry, FileTree, FsPath, Kind, Xattrs};
 use regex::bytes::Regex;
+use serde_json::json;
 use snafu::{ensure_whatever, OptionExt, ResultExt};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -151,6 +153,10 @@ impl ErofsTree {
             len,
             dir,
         };
+        eventlog::event(
+            "erofs-extract",
+            json!({ "image": image, "offset": offset, "dir": tree.root() }),
+        );
         let mut extract = OsString::from("--extract=");
         extract.push(tree.root());
         let output = Command::new("fsck.erofs")
@@ -538,10 +544,12 @@ impl FileTree for ErofsTree {
                 fsfiles::insert_unique(&mut listed, fs_path, (nid, Some(file_type)))?;
             }
         }
+        let mut not_extracted = Vec::new();
         for (fs_path, (_, file_type)) in &listed {
             if entries.contains_key(fs_path) {
                 continue;
             }
+            not_extracted.push(display(fs_path));
             let kind = match *file_type {
                 Some(FT_CHRDEV) => Kind::CharDevice,
                 Some(FT_BLKDEV) => Kind::BlockDevice,
@@ -566,6 +574,16 @@ impl FileTree for ErofsTree {
             let path = root.join(std::ffi::OsStr::from_bytes(&fs_path[1..]));
             entries.insert(fs_path.clone(), (path, entry));
         }
+
+        eventlog::event(
+            "erofs-listing",
+            json!({
+                "image": self.image,
+                "directories": dirs.len(),
+                "entries": entries.len(),
+                "device_nodes_not_extracted": not_extracted,
+            }),
+        );
 
         let image = File::open(&self.image)
             .whatever_context(format!("failed to open {}", self.image.display()))?;

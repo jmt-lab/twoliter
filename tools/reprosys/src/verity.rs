@@ -65,6 +65,22 @@ impl VerityTable {
             })
         })()
     }
+
+    /// Describe the table for the log, with the root hash and salt in hex.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "version": self.version,
+            "data_device": self.data_device,
+            "hash_device": self.hash_device,
+            "data_block_size": self.data_block_size,
+            "hash_block_size": self.hash_block_size,
+            "data_blocks": self.data_blocks,
+            "hash_start_block": self.hash_start_block,
+            "algorithm": self.algorithm,
+            "root_hash": hex::encode(&self.root_hash),
+            "salt": hex::encode(&self.salt),
+        })
+    }
 }
 
 #[cfg(test)]

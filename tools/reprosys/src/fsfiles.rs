@@ -1,12 +1,13 @@
 //! File-level comparison of partitions whose bytes are expected to differ.
 
 use crate::error::Result;
+use crate::eventlog;
 use crate::kmod;
 use ext4_view::Ext4;
 use fatfs::{FileSystem, FsOptions};
 use regex::bytes::Regex;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256, Sha512};
 use snafu::{ensure_whatever, OptionExt, ResultExt};
 use std::collections::{BTreeMap, BTreeSet};
@@ -929,6 +930,14 @@ fn compare_hmac(path: &[u8], expected: &[u8], actual: &[u8], published: &Files) 
     }
 }
 
+/// The size and sha256 of a file, for the log.
+fn contents_json(data: Option<&[u8]>) -> Value {
+    data.map_or(
+        Value::Null,
+        |d| json!({ "size": d.len(), "sha256": hex::encode(Sha256::digest(d)) }),
+    )
+}
+
 /// Compare all files; identical ones are logged but not returned.
 pub fn compare_files(expected: &Files, actual: &Files, rules: Rules) -> Vec<FileReport> {
     let mut paths: Vec<&FsPath> = expected.keys().chain(actual.keys()).collect();
@@ -941,14 +950,27 @@ pub fn compare_files(expected: &Files, actual: &Files, rules: Rules) -> Vec<File
                 expected.get(p).map(Vec::as_slice),
                 actual.get(p).map(Vec::as_slice),
             );
-            match (e, a) {
+            let report = match (e, a) {
                 (Some(e), Some(a))
                     if rules == Rules::Boot && p.to_ascii_lowercase().ends_with(HMAC_SUFFIX) =>
                 {
                     compare_hmac(p, e, a, actual)
                 }
                 _ => compare_file(p, e, a, rules),
+            };
+            if eventlog::enabled() {
+                eventlog::event(
+                    "file",
+                    json!({
+                        "path": report.path,
+                        "status": report.status,
+                        "detail": report.detail,
+                        "rebuilt": contents_json(e),
+                        "published": contents_json(a),
+                    }),
+                );
             }
+            report
         })
         .filter(|r| r.status != FileStatus::Match)
         .collect()
@@ -1022,7 +1044,34 @@ fn describe_xattr(value: Option<&Vec<u8>>) -> String {
     }
 }
 
+/// An xattr value for the log, as text or hex.
+fn xattr_json(value: &[u8]) -> Value {
+    let text = value.strip_suffix(b"\0").unwrap_or(value);
+    match std::str::from_utf8(text) {
+        Ok(text) if text.chars().all(|c| c.is_ascii_graphic() || c == ' ') => text.into(),
+        _ => json!({ "hex": hex::encode(value) }),
+    }
+}
+
 impl Entry {
+    /// Describe the entry for the log.
+    fn to_json(&self) -> Value {
+        json!({
+            "kind": self.kind.name(),
+            "mode": format!("{:04o}", self.mode),
+            "uid": self.uid,
+            "gid": self.gid,
+            "link": self.link.as_deref().map(display),
+            "device": self.device.map(|(major, minor)| format!("{major}:{minor}")),
+            "size": (self.kind == Kind::File).then_some(self.size),
+            "xattrs": self
+                .xattrs
+                .iter()
+                .map(|(name, value)| (display(name), xattr_json(value)))
+                .collect::<serde_json::Map<_, _>>(),
+        })
+    }
+
     /// How `self` (rebuilt) differs from `other` (published), apart from contents.
     fn differences(&self, other: &Self) -> Vec<String> {
         let mut out = Vec::new();
@@ -1123,6 +1172,19 @@ impl ContentDigest {
     }
 }
 
+impl ContentDigest {
+    fn of_slice(data: &[u8]) -> Self {
+        Self {
+            len: data.len() as u64,
+            sha256: Sha256::digest(data).into(),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({ "size": self.len, "sha256": hex::encode(self.sha256) })
+    }
+}
+
 impl fmt::Display for ContentDigest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} bytes, sha256 {}", self.len, hex::encode(self.sha256))
@@ -1136,6 +1198,18 @@ fn read_contents(reader: impl Read, size: u64) -> Result<Vec<u8>> {
         .read_to_end(&mut out)
         .whatever_context("failed to read file")?;
     Ok(out)
+}
+
+fn log_contents(path: &[u8], method: &str, expected: &ContentDigest, actual: &ContentDigest) {
+    eventlog::event(
+        "contents",
+        json!({
+            "path": display(path),
+            "method": method,
+            "rebuilt": expected.to_json(),
+            "published": actual.to_json(),
+        }),
+    );
 }
 
 /// A regular file in a tree: the tree, the file's handle and its size.
@@ -1174,10 +1248,19 @@ fn compare_contents<E: FileTree, A: FileTree>(
         }
         let expected = read_contents(e_tree.open(e_handle)?, e_size)?;
         let actual = read_contents(a_tree.open(a_handle)?, a_size)?;
+        if eventlog::enabled() {
+            log_contents(
+                path,
+                "content-aware",
+                &ContentDigest::of_slice(&expected),
+                &ContentDigest::of_slice(&actual),
+            );
+        }
         return Ok(compare_file(path, Some(&expected), Some(&actual), rules));
     }
     let expected = ContentDigest::of(e_tree.open(e_handle)?, e_size)?;
     let actual = ContentDigest::of(a_tree.open(a_handle)?, a_size)?;
+    log_contents(path, "sha256", &expected, &actual);
     Ok(if expected == actual {
         report(path, FileStatus::Match, "identical")
     } else {
@@ -1199,6 +1282,10 @@ pub fn compare_trees<E: FileTree, A: FileTree>(
 ) -> Result<Vec<FileReport>> {
     let expected_entries = expected.entries()?;
     let actual_entries = actual.entries()?;
+    eventlog::event(
+        "entries",
+        json!({ "rebuilt": expected_entries.len(), "published": actual_entries.len() }),
+    );
     let mut paths: Vec<&FsPath> = expected_entries
         .keys()
         .chain(actual_entries.keys())
@@ -1235,6 +1322,19 @@ pub fn compare_trees<E: FileTree, A: FileTree>(
                 )
             }
         };
+        if eventlog::enabled() {
+            let entry = |e: Option<&Entry>| e.map_or(Value::Null, Entry::to_json);
+            eventlog::event(
+                "entry",
+                json!({
+                    "path": file.path,
+                    "status": file.status,
+                    "detail": file.detail,
+                    "rebuilt": entry(e.map(|(_, e)| e)),
+                    "published": entry(a.map(|(_, a)| a)),
+                }),
+            );
+        }
         if file.status != FileStatus::Match {
             reports.push(file);
         }
@@ -1245,7 +1345,6 @@ pub fn compare_trees<E: FileTree, A: FileTree>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use serde_json::json;
     use std::io::Write;
 
     /// Build a small FAT image containing `files` (paths relative to the root).

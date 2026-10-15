@@ -212,6 +212,29 @@ impl VerifyAmi {
         let (downloaded, built) = (downloaded?, built?);
 
         let report_path = work_dir.join("report.json");
+        let log_path = work_dir.join("log.jsonl");
+        // Start a new log with what was verified; reprosys appends each comparison step.
+        let header = serde_json::json!({
+            "time_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
+            "event": "verify",
+            "region": null,
+            "twoliter_version": env!("CARGO_PKG_VERSION"),
+            "ami_id": self.ami_id,
+            "ami_name": info.ami_name,
+            "variant": info.variant,
+            "arch": info.arch,
+            "version": info.version,
+            "build_id": info.build_id,
+            "owner": info.owner,
+            "source_dir": source_dir,
+            "rebuilt_image": built.os_image,
+            "rebuilt_data_image": built.data_image,
+            "published_image": downloaded.root_image,
+            "published_data_image": downloaded.data_image,
+        });
+        fs::write(&log_path, format!("{header}\n")).await?;
         let mut compare_args = vec![
             "compare".to_string(),
             "--expected".to_string(),
@@ -220,6 +243,8 @@ impl VerifyAmi {
             downloaded.root_image.display().to_string(),
             "--report".to_string(),
             report_path.display().to_string(),
+            "--log".to_string(),
+            log_path.display().to_string(),
         ];
         // reprosys fails verification when only one side has a data image.
         if let Some(expected) = &built.data_image {
@@ -240,6 +265,7 @@ impl VerifyAmi {
             .context("Unable to parse the comparison report")?;
         println!("Verification result: {}", report.verdict);
         println!("Report:    {}", report_path.display());
+        println!("Log:       {}", log_path.display());
         if let Some(build_log) = &build_log {
             println!("Build log: {}", build_log.display());
         }

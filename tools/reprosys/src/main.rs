@@ -6,6 +6,7 @@ mod disk;
 mod download;
 mod erofs;
 mod error;
+mod eventlog;
 mod fsfiles;
 mod kmod;
 mod verity;
@@ -91,6 +92,11 @@ enum Command {
         /// Also write the JSON report to this file
         #[arg(long)]
         report: Option<PathBuf>,
+
+        /// Append a detailed log of every comparison step to this file, as
+        /// JSON Lines
+        #[arg(long)]
+        log: Option<PathBuf>,
     },
 }
 
@@ -183,14 +189,24 @@ async fn run(args: Args) -> Result<ExitCode> {
             expected_data,
             actual_data,
             report,
+            log,
         } => {
+            if let Some(path) = &log {
+                eventlog::open(path)?;
+            }
             let result = compare::compare(
                 &expected,
                 &actual,
                 expected_data.as_deref(),
                 actual_data.as_deref(),
             );
+            if let Err(e) = &result {
+                let error = snafu::Report::from_error(e).to_string();
+                eventlog::event("error", serde_json::json!({ "error": error }));
+            }
+            let closed = eventlog::close();
             let result = result?;
+            closed?;
             let json = print_json(&result)?;
             if let Some(path) = report {
                 std::fs::write(&path, json)
