@@ -1,7 +1,9 @@
 //! dm-verity table parsing, so tables can be compared beyond their root hash and salt.
 
 use crate::error::Result;
+use crate::fsfiles::hex_bytes;
 use regex::bytes::Regex;
+use serde::Serialize;
 use snafu::{ensure_whatever, OptionExt, ResultExt};
 use std::sync::LazyLock;
 
@@ -14,7 +16,7 @@ static TABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Parameters of a dm-verity device as given in its device-mapper table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VerityTable {
     pub version: u32,
     pub data_device: String,
@@ -24,7 +26,9 @@ pub struct VerityTable {
     pub data_blocks: u64,
     pub hash_start_block: u64,
     pub algorithm: String,
+    #[serde(serialize_with = "hex_bytes")]
     pub root_hash: Vec<u8>,
+    #[serde(serialize_with = "hex_bytes")]
     pub salt: Vec<u8>,
 }
 
