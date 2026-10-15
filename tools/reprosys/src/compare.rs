@@ -1,10 +1,11 @@
 //! Compare a rebuilt disk image against the image published in an AMI.
 
-use crate::disk::{self, DiskLayout, Policy, RangeHash};
+use crate::disk::{self, DiskLayout, Partition, Policy, RangeHash};
+use crate::erofs::{self, ErofsTree};
 use crate::error::Result;
-use crate::fsfiles::FileReport;
+use crate::fsfiles::{self, FileReport, FileStatus, Rules};
 use serde::Serialize;
-use snafu::ResultExt;
+use snafu::{ensure_whatever, ResultExt};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,7 @@ use std::path::{Path, PathBuf};
 pub enum Status {
     Match,
     Mismatch,
+    ExpectedDifference,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -75,6 +77,8 @@ const NOTES: &[&str] = &[];
 struct Images {
     expected: File,
     actual: File,
+    expected_path: PathBuf,
+    actual_path: PathBuf,
 }
 
 impl Images {
@@ -84,6 +88,8 @@ impl Images {
         Ok(Self {
             expected: open(expected)?,
             actual: open(actual)?,
+            expected_path: expected.to_path_buf(),
+            actual_path: actual.to_path_buf(),
         })
     }
 
@@ -183,7 +189,15 @@ pub fn compare_os(expected: &Path, actual: &Path) -> Result<ImageReport> {
         let policy = p.policy();
         let ranges = [(p.offset, p.len)];
         let (e, a) = images.hash(&ranges)?;
-        let r = assess_region(&p.name, policy, &ranges, Some(&e), &a);
+        let mut r = assess_region(&p.name, policy, &ranges, Some(&e), &a);
+        match policy {
+            Policy::MustMatch | Policy::MustBeZero | Policy::Verity => {}
+            Policy::FilesMustMatch if r.status != Status::Match => {
+                compare_root(&images, p, &mut r)?
+            }
+            Policy::FilesMustMatch => {}
+            Policy::SigningDependent => {}
+        }
         report.regions.push(r);
     }
 
@@ -198,6 +212,73 @@ pub fn compare_os(expected: &Path, actual: &Path) -> Result<ImageReport> {
     }
 
     Ok(report)
+}
+
+/// Compare a ROOT-A whose bytes differ file by file. Only erofs is supported;
+/// any other ROOT-A that differs fails.
+fn compare_root(images: &Images, p: &Partition, r: &mut RegionReport) -> Result<()> {
+    let fs_name = |erofs: bool| if erofs { "erofs" } else { "not erofs" };
+    let expected_erofs = erofs::is_erofs(&images.expected, p.offset)?;
+    let actual_erofs = erofs::is_erofs(&images.actual, p.offset)?;
+    if !(expected_erofs && actual_erofs) {
+        r.detail = format!(
+            "the rebuilt ROOT-A is {} and the published ROOT-A is {}; only erofs root \
+             filesystems are supported, so the files were not compared",
+            fs_name(expected_erofs),
+            fs_name(actual_erofs)
+        );
+        return Ok(());
+    }
+    erofs::require_tools()?;
+    // Extract next to the published image, where there is room.
+    let work_dir = images
+        .actual_path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let files = (|| {
+        // Compressed files can expand to any size, so bound them before extracting.
+        let expected_size = erofs::total_file_size(&images.expected_path, p.offset)?;
+        let actual_size = erofs::total_file_size(&images.actual_path, p.offset)?;
+        ensure_whatever!(
+            actual_size <= expected_size.saturating_add(p.len),
+            "the published ROOT-A holds {actual_size} bytes of files, more than the rebuilt \
+             ROOT-A ({expected_size} bytes) plus the size of the partition; it was not \
+             extracted"
+        );
+        let e = ErofsTree::extract(&images.expected_path, p.offset, p.len, work_dir)?;
+        let a = ErofsTree::extract(&images.actual_path, p.offset, p.len, work_dir)?;
+        fsfiles::compare_trees(&e, &a, Rules::Root, p.len)
+    })();
+    match files {
+        Ok(files) => {
+            let mismatches = files
+                .iter()
+                .filter(|f| f.status == FileStatus::Mismatch)
+                .count();
+            if files.is_empty() {
+                r.detail = "contents differ, but all entries are identical; the difference is in \
+                            what is not compared (timestamps or filesystem layout)"
+                    .to_string();
+            } else if mismatches == 0 {
+                r.status = Status::ExpectedDifference;
+                r.detail = format!(
+                    "files differ only in kernel module signatures, the TUF root role and the SBOMs; {} differing files listed",
+                    files.len()
+                );
+            } else {
+                r.detail = format!(
+                    "{mismatches} of {} differing files differ beyond kernel module signatures, the TUF root role and the SBOMs",
+                    files.len()
+                );
+            }
+            r.files = files;
+        }
+        Err(e) => {
+            r.detail = format!("contents differ and files could not be read: {e}");
+        }
+    }
+    Ok(())
 }
 
 /// Compare the data image over the rebuilt image's length, and check that the rest is zero.
@@ -444,4 +525,264 @@ mod tests {
             );
         }
     }
+}
+
+/// Comparisons of real filesystems, which need `mkfs.ext4` and erofs-utils.
+#[cfg(test)]
+mod rootfs_tests {
+    use super::*;
+    use crate::disk::tests::{write_gpt, MIB};
+    use crate::fsfiles::FileTree;
+    use std::collections::BTreeMap;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileExt, PermissionsExt};
+    use std::process::Command;
+
+    struct Rootfs<'a> {
+        signing_key: &'a [u8],
+        os_release: &'a str,
+        all_root: bool,
+        /// Value of `user.big` on /etc/os-release, long enough to be shown by digest.
+        big_xattr: &'a [u8],
+        /// The device number of a character device at /console: 1:3 or 1:5.
+        console: Option<(u32, u32)>,
+    }
+
+    const BIG_XATTR: &[u8] = &[b'x'; 600];
+
+    const DEFAULT: Rootfs<'static> = Rootfs {
+        signing_key: b"key-one",
+        os_release: "v1",
+        all_root: true,
+        big_xattr: BIG_XATTR,
+        console: None,
+    };
+
+    fn set_xattr(path: &Path, name: &str, value: &[u8]) {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = CString::new(name).unwrap();
+        // SAFETY: the pointers are valid for the duration of the call.
+        let rc = unsafe {
+            libc::lsetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    fn populate(src: &Path, rootfs: &Rootfs) {
+        let modules = src.join("lib/modules/6.1/kernel");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::create_dir_all(src.join("etc")).unwrap();
+        std::fs::write(
+            modules.join("xfs.ko"),
+            crate::kmod::tests::sign(b"\x7fELFxfs", rootfs.signing_key),
+        )
+        .unwrap();
+        std::fs::write(src.join("etc/os-release"), rootfs.os_release).unwrap();
+        std::fs::write(src.join("etc/shadow"), "root:*").unwrap();
+        std::fs::write(src.join("etc/sudo"), "suid").unwrap();
+        std::os::unix::fs::symlink("../lib", src.join("etc/lib")).unwrap();
+        // On enough entries that erofs stores it once, as a shared xattr.
+        for p in ["etc/shadow", "etc/sudo", "etc/os-release", "lib"] {
+            set_xattr(&src.join(p), "user.small", b"1");
+        }
+        set_xattr(&src.join("etc/os-release"), "user.big", rootfs.big_xattr);
+        let chmod =
+            |p: &str, mode| std::fs::set_permissions(src.join(p), PermissionsExt::from_mode(mode));
+        chmod("etc/shadow", 0o400).unwrap();
+        chmod("etc/sudo", 0o4755).unwrap();
+        chmod("lib/modules", 0o555).unwrap();
+    }
+
+    fn mkfs(dir: &Path, name: &str, rootfs: &Rootfs) -> Vec<u8> {
+        let src = dir.join(format!("{name}-src"));
+        populate(&src, rootfs);
+        let img = dir.join(format!("{name}.fs"));
+        let mut cmd = Command::new("mkfs.erofs");
+        cmd.args(["-T", "1", "-U", "11111111-1111-1111-1111-111111111111"]);
+        cmd.args(["-z", "lz4hc,12"]);
+        if rootfs.all_root {
+            cmd.arg("--all-root");
+        }
+        if let Some(console) = rootfs.console {
+            // Creating device nodes needs root, so archive existing ones under a new name.
+            let dev = match console {
+                (1, 3) => "dev/null",
+                (1, 5) => "dev/zero",
+                _ => unreachable!("no device node for {console:?}"),
+            };
+            let tar = dir.join(format!("{name}.tar"));
+            let output = Command::new("tar")
+                .args(["--format=posix", "--xattrs", "--xattrs-include=user.*"])
+                .arg(format!("--transform=s,^{dev}$,./console,"))
+                .arg("-cf")
+                .arg(&tar)
+                .arg("-C")
+                .arg(&src)
+                .arg(".")
+                .args(["-C", "/", dev])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            cmd.arg("--tar=f").arg(&img).arg(tar);
+        } else {
+            cmd.arg(&img).arg(&src);
+        }
+        let output = cmd.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        std::fs::set_permissions(src.join("lib/modules"), PermissionsExt::from_mode(0o755))
+            .unwrap();
+        std::fs::read(img).unwrap()
+    }
+
+    /// A disk image whose ROOT-A holds `root`.
+    fn root_image(dir: &Path, name: &str, root: &[u8]) -> PathBuf {
+        let path = dir.join(format!("{name}.img"));
+        let mut f = File::create_new(&path).unwrap();
+        write_gpt(&mut f, 8 * MIB, &[("BOTTLEROCKET-ROOT-A", [1; 16], 1, 2)]);
+        f.write_all_at(root, MIB).unwrap();
+        path
+    }
+
+    fn os_image(dir: &Path, name: &str, rootfs: &Rootfs) -> PathBuf {
+        root_image(dir, name, &mkfs(dir, name, rootfs))
+    }
+
+    fn entries(image: &Path) -> BTreeMap<Vec<u8>, fsfiles::Entry> {
+        let tree = ErofsTree::extract(image, MIB, 2 * MIB, image.parent().unwrap()).unwrap();
+        let entries = tree.entries().unwrap().into_iter();
+        entries.map(|(path, (_, e))| (path, e)).collect()
+    }
+
+    fn root_a(expected: &Path, actual: &Path) -> RegionReport {
+        let report = compare(expected, actual, None, None).unwrap();
+        let root = report.os.regions.into_iter().find(|r| r.name == "ROOT-A");
+        root.unwrap()
+    }
+
+    fn file<'a>(r: &'a RegionReport, path: &str) -> &'a FileReport {
+        r.files.iter().find(|f| f.path == path).unwrap()
+    }
+
+    #[test]
+    #[ignore = "needs erofs-utils"]
+    fn erofs_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let rebuilt = os_image(d, "rebuilt", &DEFAULT);
+
+        let found = entries(&rebuilt);
+        assert!(found.contains_key(b"/".as_slice()), "{found:?}");
+        let user = |path: &str, name: &str| {
+            found[&path.as_bytes().to_vec()]
+                .xattrs
+                .get(name.as_bytes())
+                .cloned()
+        };
+        assert_eq!(user("/etc/sudo", "user.small"), Some(b"1".to_vec()));
+        assert_eq!(user("/lib", "user.small"), Some(b"1".to_vec()));
+        assert_eq!(
+            user("/etc/os-release", "user.big"),
+            Some(BIG_XATTR.to_vec())
+        );
+        assert_eq!(user("/etc/lib", "user.small"), None);
+
+        let same = os_image(d, "same", &DEFAULT);
+        assert_eq!(root_a(&rebuilt, &same).status, Status::Match);
+
+        let resigned = Rootfs {
+            signing_key: b"key-two",
+            ..DEFAULT
+        };
+        let r = root_a(&rebuilt, &os_image(d, "resigned", &resigned));
+        assert_eq!(r.status, Status::ExpectedDifference, "{r:#?}");
+        assert_eq!(r.files.len(), 1, "{r:#?}");
+        assert_eq!(
+            file(&r, "/lib/modules/6.1/kernel/xfs.ko").status,
+            FileStatus::ExpectedDifference
+        );
+
+        let changed = Rootfs {
+            signing_key: b"key-two",
+            os_release: "v2",
+            ..DEFAULT
+        };
+        let r = root_a(&rebuilt, &os_image(d, "changed", &changed));
+        assert_eq!(r.status, Status::Mismatch, "{r:#?}");
+        assert_eq!(file(&r, "/etc/os-release").status, FileStatus::Mismatch);
+
+        // A changed xattr fails, even alongside an expected difference.
+        let mut big = BIG_XATTR.to_vec();
+        *big.last_mut().unwrap() = b'y';
+        let relabeled = Rootfs {
+            signing_key: b"key-two",
+            big_xattr: &big,
+            ..DEFAULT
+        };
+        let r = root_a(&rebuilt, &os_image(d, "relabeled", &relabeled));
+        assert_eq!(r.status, Status::Mismatch, "{r:#?}");
+        let detail = &file(&r, "/etc/os-release").detail;
+        assert!(
+            detail.starts_with("xattr user.big 600 bytes, sha256 "),
+            "{detail}"
+        );
+
+        let owned = Rootfs {
+            all_root: false,
+            ..DEFAULT
+        };
+        let r = root_a(&rebuilt, &os_image(d, "owned", &owned));
+        assert_eq!(r.status, Status::Mismatch, "{r:#?}");
+        assert!(
+            file(&r, "/etc/shadow").detail.starts_with("owner 0:0 vs"),
+            "{r:#?}"
+        );
+        // Device nodes are compared, though extraction skips them.
+        let null = Rootfs {
+            console: Some((1, 3)),
+            ..DEFAULT
+        };
+        let with_null = os_image(d, "null", &null);
+        let console = &entries(&with_null)[b"/console".as_slice()];
+        assert_eq!(console.kind, fsfiles::Kind::CharDevice);
+        assert_eq!(console.device, Some((1, 3)));
+        let r = root_a(
+            &with_null,
+            &os_image(
+                d,
+                "null-resigned",
+                &Rootfs {
+                    signing_key: b"key-two",
+                    ..null
+                },
+            ),
+        );
+        assert_eq!(r.status, Status::ExpectedDifference, "{r:#?}");
+        let zero = Rootfs {
+            signing_key: b"key-two",
+            console: Some((1, 5)),
+            ..DEFAULT
+        };
+        let r = root_a(&with_null, &os_image(d, "zero", &zero));
+        assert_eq!(r.status, Status::Mismatch, "{r:#?}");
+        assert_eq!(file(&r, "/console").detail, "device 1:3 vs 1:5");
+        let r = root_a(&with_null, &os_image(d, "no-console", &resigned));
+        assert_eq!(r.status, Status::Mismatch, "{r:#?}");
+        assert_eq!(file(&r, "/console").detail, "missing from published image");
+
+        // Extraction directories are cleaned up, even read-only ones.
+        let leftovers: Vec<_> = std::fs::read_dir(d)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("erofs-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
 }
