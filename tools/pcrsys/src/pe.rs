@@ -95,6 +95,26 @@ pub fn extract_sbat_level(pe_data: &[u8]) -> Result<Vec<u8>> {
     Ok(section_data[HEADER_SIZE..end].to_vec())
 }
 
+/// Get the name and raw data of every section of a PE32+ file, in file order.
+pub fn sections(pe_data: &[u8]) -> Result<Vec<(String, &[u8])>> {
+    let pe = PeFile::<pe::ImageNtHeaders64>::parse(pe_data)
+        .ok()
+        .whatever_context("failed to parse PE32+ file")?;
+    pe.sections()
+        .map(|section| {
+            let name = section
+                .name()
+                .ok()
+                .whatever_context("failed to read section name")?;
+            let data = section
+                .data()
+                .ok()
+                .whatever_context("failed to read section data")?;
+            Ok((name.to_string(), data))
+        })
+        .collect()
+}
+
 /// Get raw data from a named PE section.
 fn get_section_data<'a>(pe_data: &'a [u8], name: &str) -> Result<&'a [u8]> {
     let pe = PeFile::<pe::ImageNtHeaders64>::parse(pe_data)
@@ -224,6 +244,15 @@ pub(crate) mod tests {
         let cert = extract_vendor_cert(&shim).unwrap();
         assert_eq!(&cert[0..2], &[0x30, 0x82]); // ASN.1 SEQUENCE
         assert_eq!(cert.len(), 7);
+    }
+
+    #[test]
+    fn test_sections() {
+        let shim = build_test_shim();
+        let sections = sections(&shim).unwrap();
+        let names: Vec<_> = sections.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, [".text", ".sbatlevel", ".vendor_cert"]);
+        assert_eq!(sections[0].1, &shim[0x200..0x210]); // .text, trimmed to VirtualSize
     }
 
     #[test]
