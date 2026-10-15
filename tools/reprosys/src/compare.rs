@@ -105,10 +105,9 @@ const NOTES: &[&str] = &[
      be reproduced yet: sbomtool records the time it ran, random document IDs and CPEs in a random \
      order. They are expected to differ as long as both list the same packages, by name and \
      version; the rest of their contents is not compared.",
-    "HASH-A is formatted with a random salt; it is verified by recomputing the dm-verity tree over \
-     the published ROOT-A with the salt and root hash of the table in the published grub.cfg \
-     checked by BOOT-CONFIG, which ties the boot-time integrity check to the ROOT-A contents \
-     compared above. This is checked even when HASH-A is identical to the rebuilt one.",
+    "HASH-A is formatted with a random salt, so it never matches the rebuilt one byte for byte; \
+     its contents are not compared. The root hash and salt the image boots with are checked by \
+     BOOT-CONFIG against the rebuilt kernel command line, except for their values.",
     "PRIVATE must match byte for byte, except for the directory hash flags in its superblocks: \
      mke2fs records whether the build host's char is signed (x86_64) or unsigned (aarch64). When \
      only those differ, the rebuilt PRIVATE is given the published flags and superblock \

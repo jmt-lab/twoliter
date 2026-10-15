@@ -26,6 +26,18 @@ const REPROSYS_NOT_VERIFIED: i32 = 2;
 /// Lines of the build log shown when the build fails.
 const BUILD_LOG_TAIL: usize = 40;
 
+/// The TUF root role in ROOT-A, which rebuilds cannot reproduce and users check by hand.
+const TUF_ROOT_ROLE: &str = "/usr/share/updog/root.json";
+
+/// The fields describing the published TUF root role in its report detail.
+const ROOT_ROLE_FIELDS: &[&str] = &["sha512", "version", "expires", "keys"];
+
+/// Hex strings at least this long are shortened in the summary; the report has them in full.
+const LONG_HASH: usize = 32;
+
+/// Width the summary's prose is wrapped to.
+const WRAP_WIDTH: usize = 100;
+
 #[derive(Debug, Parser)]
 pub(crate) enum VerifyCommand {
     Ami(VerifyAmi),
@@ -80,7 +92,8 @@ pub(crate) struct VerifyAmi {
     #[clap(long)]
     pub(crate) keep: bool,
 
-    /// Show the build output instead of writing it to `build.log` in the work directory.
+    /// Show the build output instead of writing it to `build.log` in the work directory, and list
+    /// every differing file, full hashes and an explanation of each check in the summary.
     #[clap(long)]
     pub(crate) verbose: bool,
 }
@@ -108,6 +121,32 @@ struct Downloaded {
 #[derive(Debug, Deserialize)]
 struct Report {
     verdict: String,
+    os: ImageReport,
+    data: Option<ImageReport>,
+    #[serde(default)]
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageReport {
+    regions: Vec<RegionReport>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegionReport {
+    name: String,
+    status: String,
+    fatal: bool,
+    detail: String,
+    #[serde(default)]
+    files: Vec<FileReport>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileReport {
+    path: String,
+    status: String,
+    detail: String,
 }
 
 /// Images rebuilt from source.
@@ -263,7 +302,7 @@ impl VerifyAmi {
             .context("Unable to compare the rebuilt image against the AMI")?;
         let report: Report = serde_json::from_slice(&fs::read(&report_path).await?)
             .context("Unable to parse the comparison report")?;
-        println!("Verification result: {}", report.verdict);
+        print!("{}", summary(&report, &self.ami_id, &info, self.verbose));
         println!("Report:    {}", report_path.display());
         println!("Log:       {}", log_path.display());
         if let Some(build_log) = &build_log {
@@ -617,6 +656,191 @@ async fn lz4_decompress(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+impl RegionReport {
+    fn failed(&self) -> bool {
+        self.fatal && self.status == "mismatch"
+    }
+
+    /// The summary's marker for this region, and its rank: failures are listed first.
+    fn marker(&self) -> (&'static str, u8) {
+        match (self.status.as_str(), self.fatal) {
+            ("match", _) => ("ok", 3),
+            ("expected-difference", _) => ("note", 2),
+            (_, true) => ("FAIL", 0),
+            (_, false) => ("warn", 1),
+        }
+    }
+}
+
+/// Render the comparison report for the terminal.
+fn summary(report: &Report, ami_id: &str, info: &AmiInfo, verbose: bool) -> String {
+    let mut out = Vec::new();
+    let shorten = |text: &str| {
+        if verbose {
+            text.to_string()
+        } else {
+            shorten_hashes(text)
+        }
+    };
+    out.push(String::new());
+    out.push(format!(
+        "Verification of {ami_id} ({} {} v{}, commit {})",
+        info.variant, info.arch, info.version, info.build_id
+    ));
+
+    let mut root_role = None;
+    let images = std::iter::once(("OS image", &report.os))
+        .chain(report.data.as_ref().map(|d| ("Data image", d)));
+    for (title, image) in images {
+        out.push(String::new());
+        out.push(title.to_string());
+        let mut regions: Vec<&RegionReport> = image.regions.iter().collect();
+        regions.sort_by_key(|r| r.marker().1);
+        let (identical, differing): (Vec<_>, Vec<_>) =
+            regions.into_iter().partition(|r| r.status == "match");
+        for region in differing {
+            out.push(format!(
+                "  {:<5} {:<12} {}",
+                region.marker().0,
+                region.name,
+                shorten(&region.detail)
+            ));
+            let mut hidden = 0;
+            for file in region.files.iter().filter(|f| f.status != "match") {
+                if file.status == "expected-difference" && file.path.ends_with(TUF_ROOT_ROLE) {
+                    root_role = Some(file);
+                }
+                if file.status == "mismatch" {
+                    out.push(format!("          {}", file.path));
+                    out.push(format!("            {}", shorten(&file.detail)));
+                } else if verbose {
+                    out.push(format!("          {}", file.path));
+                    out.push(format!("            expected difference: {}", file.detail));
+                } else {
+                    hidden += 1;
+                }
+            }
+            if hidden > 0 {
+                let s = if hidden == 1 { "" } else { "s" };
+                out.push(format!(
+                    "          + {hidden} expected difference{s} (shown with --verbose)"
+                ));
+            }
+        }
+        if !identical.is_empty() {
+            let names: Vec<&str> = identical.iter().map(|r| r.name.as_str()).collect();
+            out.push(format!(
+                "  {:<5} {}",
+                "ok",
+                wrap(&format!("{} identical", names.join(", ")), 8)
+            ));
+        }
+    }
+
+    if let Some(file) = root_role {
+        let published = file
+            .detail
+            .find("sha512 ")
+            .map_or(file.detail.as_str(), |i| &file.detail[i..]);
+        out.push(String::new());
+        out.push("Check by hand".to_string());
+        out.push(format!(
+            "  {}",
+            wrap(
+                "The TUF root role (/usr/share/updog/root.json) cannot be rebuilt without the \
+                 release keys. Check that the AMI's root role is the one your repository \
+                 publishes (for Bottlerocket, https://cache.bottlerocket.aws/root.json):",
+                2
+            )
+        ));
+        // "sha512 <digest>, version <n>, expires <time>, keys <id>, <id>": one field per line.
+        for field in published.split(", ") {
+            match field.split_once(' ') {
+                Some((label, value)) if ROOT_ROLE_FIELDS.contains(&label) => {
+                    out.push(format!("    {label:<8} {value}"));
+                }
+                _ => out.push(format!("    {:<8} {field}", "")),
+            }
+        }
+    }
+
+    out.push(String::new());
+    if verbose {
+        for note in &report.notes {
+            out.push(format!("Note: {}", wrap(note, 6)));
+        }
+    } else {
+        out.push(wrap(
+            "FAIL fails verification. note marks differences that per-build signing keys, \
+             random salts or the build host's architecture explain; they do not fail \
+             verification. The report explains each check, and --verbose shows more detail.",
+            0,
+        ));
+    }
+
+    out.push(String::new());
+    let failed: Vec<&str> = std::iter::once(&report.os)
+        .chain(&report.data)
+        .flat_map(|image| &image.regions)
+        .filter(|r| r.failed())
+        .map(|r| r.name.as_str())
+        .collect();
+    if report.verdict == "verified" {
+        out.push("Result: VERIFIED".to_string());
+    } else if failed.is_empty() {
+        out.push("Result: FAILED".to_string());
+    } else {
+        out.push(format!(
+            "Result: FAILED ({} differ{} from the rebuilt image)",
+            failed.join(", "),
+            if failed.len() == 1 { "s" } else { "" }
+        ));
+    }
+    out.push(String::new());
+    out.join("\n")
+}
+
+/// Shorten hex strings of at least `LONG_HASH` characters to their first 12.
+fn shorten_hashes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(|c: char| c.is_ascii_hexdigit()) {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let len = rest
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(rest.len());
+        if len >= LONG_HASH {
+            out.push_str(&rest[..12]);
+            out.push('…');
+        } else {
+            out.push_str(&rest[..len]);
+        }
+        rest = &rest[len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Wrap `text` to `WRAP_WIDTH`, indenting continuation lines by `indent` spaces.
+fn wrap(text: &str, indent: usize) -> String {
+    let mut out = String::new();
+    let mut column = indent;
+    for word in text.split_whitespace() {
+        if column > indent && column + 1 + word.len() > WRAP_WIDTH {
+            out.push('\n');
+            out.push_str(&" ".repeat(indent));
+            column = indent;
+        } else if column > indent {
+            out.push(' ');
+            column += 1;
+        }
+        out.push_str(word);
+        column += word.chars().count();
+    }
+    out
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -639,6 +863,132 @@ mod tests {
             path,
             aws_args: Vec::new(),
         }
+    }
+
+    fn region(
+        name: &str,
+        status: &str,
+        fatal: bool,
+        detail: &str,
+        files: &[(&str, &str, &str)],
+    ) -> serde_json::Value {
+        let files: Vec<_> = files
+            .iter()
+            .map(|(path, status, detail)| {
+                serde_json::json!({ "path": path, "status": status, "detail": detail })
+            })
+            .collect();
+        serde_json::json!({
+            "name": name, "status": status, "fatal": fatal, "detail": detail, "files": files,
+        })
+    }
+
+    fn report(root_a_status: &str) -> Report {
+        let sha = "a9f9a4d30f465f0846e4d73f6d77ad669100410ef5241097ea40932329a1f99f";
+        let root_role = format!(
+            "TUF root role; rebuilds generate their own because the release root role keys are \
+             not available. Check the published root role against the one your repository \
+             publishes: sha512 {sha}{sha}, version 1, expires 2027-10-12T17:12:35Z, keys {sha}"
+        );
+        let mut root_files = vec![(
+            "/x86_64-bottlerocket-linux-gnu/sys-root/usr/share/updog/root.json",
+            "expected-difference",
+            root_role.as_str(),
+        )];
+        let settings =
+            format!("contents differ (3539600 bytes, sha256 {sha} vs 3539152 bytes, sha256 {sha})");
+        if root_a_status == "mismatch" {
+            root_files.push((
+                "/x86_64-bottlerocket-linux-gnu/sys-root/usr/lib/settings-plugins/aws-dev/libsettings.so",
+                "mismatch",
+                settings.as_str(),
+            ));
+        }
+        serde_json::from_value(serde_json::json!({
+            "verdict": if root_a_status == "mismatch" { "failed" } else { "verified" },
+            "os": { "regions": [
+                region("GPT", "match", true, "identical", &[]),
+                region("EFI-A", "expected-difference", true, "files differ only in signing-dependent content", &[
+                    ("/EFI/BOOT/grubx64.efi", "expected-difference", "differs only in sections holding embedded keys (.pubkey)"),
+                    ("/EFI/BOOT/db.crt", "expected-difference", "signing artifact"),
+                ]),
+                region("BOOT-A", "expected-difference", true, "files differ only in signing-dependent content", &[
+                    ("/vmlinuz", "expected-difference", "signatures differ"),
+                    ("/grub/grub.cfg.sig", "expected-difference", "signing artifact"),
+                ]),
+                region("ROOT-A", root_a_status, true, "differing files", &root_files),
+                region("PRIVATE", "match", true, "identical", &[]),
+            ]},
+            "data": { "regions": [region("DATA", "match", true, "identical", &[])] },
+            "notes": ["A note."],
+        }))
+        .unwrap()
+    }
+
+    fn info() -> AmiInfo {
+        serde_json::from_value(serde_json::json!({
+            "ami_name": "bottlerocket", "variant": "aws-dev", "arch": "x86_64",
+            "version": "1.67.0", "build_id": "d2569283", "filename_prefix": "bottlerocket",
+            "owner": "123", "owned_by_caller": true,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn summary_lists_failures_first_and_hides_expected_differences() {
+        let text = summary(&report("mismatch"), "ami-1", &info(), false);
+        println!("{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        let position = |prefix: &str| {
+            lines
+                .iter()
+                .position(|l| l.trim_start().starts_with(prefix))
+                .unwrap_or_else(|| panic!("no line starting with {prefix:?} in:\n{text}"))
+        };
+        assert!(position("FAIL  ROOT-A") < position("note  EFI-A"));
+        assert!(position("note  EFI-A") < position("note  BOOT-A"));
+        assert!(position("note  BOOT-A") < position("ok    GPT, PRIVATE identical"));
+        assert!(text.contains("  ok    DATA identical"));
+        assert!(text.contains("aws-dev/libsettings.so"));
+        assert!(!text.contains("/EFI/BOOT/grubx64.efi"));
+        assert!(!text.contains("/EFI/BOOT/db.crt"));
+        assert!(text.contains("+ 2 expected differences (shown with --verbose)"));
+        assert!(text.contains("sha256 a9f9a4d30f46… vs"));
+        // The root role is listed in full to check by hand.
+        let sha = "a9f9a4d30f465f0846e4d73f6d77ad669100410ef5241097ea40932329a1f99f";
+        assert!(text.contains(&format!("\n    sha512   {sha}{sha}\n    version  1\n")));
+        assert!(text.contains(&format!("\n    keys     {sha}\n")));
+        assert!(!text.contains("Note: A note."));
+        assert!(text.ends_with("Result: FAILED (ROOT-A differs from the rebuilt image)\n"));
+    }
+
+    #[test]
+    fn verbose_summary_lists_everything() {
+        let text = summary(&report("expected-difference"), "ami-1", &info(), true);
+        assert!(text.contains("/EFI/BOOT/db.crt"));
+        assert!(text.contains("expected difference: signing artifact"));
+        assert!(!text.contains('…'));
+        assert!(text.contains("Note: A note."));
+        assert!(text.contains("Check by hand"));
+        assert!(text.ends_with("Result: VERIFIED\n"));
+    }
+
+    #[test]
+    fn shortens_only_long_hashes() {
+        let long = "d91c430f8a647c11171f08308a21275f61fc991267a092253108bd24ae074fb6";
+        assert_eq!(
+            shorten_hashes(&format!("root hash {long}; snap-012c07623fe00054c")),
+            "root hash d91c430f8a64…; snap-012c07623fe00054c"
+        );
+    }
+
+    #[test]
+    fn wraps_with_indent() {
+        let text = "word ".repeat(30);
+        let wrapped = wrap(&text, 4);
+        assert!(wrapped.lines().all(|l| l.len() <= WRAP_WIDTH));
+        assert!(wrapped.lines().skip(1).all(|l| l.starts_with("    w")));
+        assert_eq!(wrapped.split_whitespace().count(), 30);
     }
 
     #[tokio::test]
