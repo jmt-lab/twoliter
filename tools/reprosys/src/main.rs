@@ -1,8 +1,11 @@
 //! Reproducibility checks for Bottlerocket AMIs. Subcommands print JSON for twoliter.
 
 mod ami;
+mod compare;
+mod disk;
 mod download;
 mod error;
+mod fsfiles;
 
 use crate::error::Result;
 use clap::{Args as ClapArgs, Parser, Subcommand};
@@ -12,6 +15,9 @@ use snafu::{OptionExt, ResultExt};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tokio::signal::unix::{signal, SignalKind};
+
+/// Exit code of `compare` when the comparison ran but verification failed.
+const EXIT_NOT_VERIFIED: u8 = 2;
 
 #[derive(Parser)]
 #[command(
@@ -58,6 +64,30 @@ enum Command {
         /// Keep snapshot copies made for snapshots owned by another account
         #[arg(long)]
         keep_copies: bool,
+    },
+
+    /// Compare a rebuilt image against a downloaded one
+    Compare {
+        /// Image rebuilt from source
+        #[arg(long)]
+        expected: PathBuf,
+
+        /// Image downloaded from the AMI
+        #[arg(long)]
+        actual: PathBuf,
+
+        /// Data image rebuilt from source. If only one of the data images is
+        /// given, verification fails.
+        #[arg(long)]
+        expected_data: Option<PathBuf>,
+
+        /// Data image downloaded from the AMI
+        #[arg(long)]
+        actual_data: Option<PathBuf>,
+
+        /// Also write the JSON report to this file
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
 }
 
@@ -143,6 +173,29 @@ async fn run(args: Args) -> Result<ExitCode> {
                 }
             };
             print_json(&DownloadOutput { ami: info, images })?;
+        }
+        Command::Compare {
+            expected,
+            actual,
+            expected_data,
+            actual_data,
+            report,
+        } => {
+            let result = compare::compare(
+                &expected,
+                &actual,
+                expected_data.as_deref(),
+                actual_data.as_deref(),
+            );
+            let result = result?;
+            let json = print_json(&result)?;
+            if let Some(path) = report {
+                std::fs::write(&path, json)
+                    .whatever_context(format!("failed to write {}", path.display()))?;
+            }
+            if result.verdict != compare::Verdict::Verified {
+                return Ok(ExitCode::from(EXIT_NOT_VERIFIED));
+            }
         }
     }
     Ok(ExitCode::SUCCESS)
