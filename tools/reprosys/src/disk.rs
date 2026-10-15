@@ -4,7 +4,7 @@ use crate::error::Result;
 use gptman::GPT;
 use pcrsys::gpt::uuid_to_guid;
 use sha2::{Digest, Sha256};
-use snafu::ResultExt;
+use snafu::{ensure_whatever, ResultExt};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
@@ -25,10 +25,12 @@ pub enum Policy {
     MustBeZero,
     /// Files must match, except for the signatures appended to kernel modules.
     FilesMustMatch,
-    /// Contents depend on the random verity salt; checked by recomputing the tree.
-    Verity,
+    /// Depends on the random verity salt; not compared.
+    SaltDependent,
     /// Contents depend on signing keys; differences are reported as warnings.
     SigningDependent,
+    /// grub.cfg must match, except for the verity root hash and salt.
+    BootConfig,
 }
 
 /// A partition from the GPT.
@@ -45,7 +47,7 @@ impl Partition {
         match self.name.as_str() {
             "EFI-A" | "BOOT-A" => Policy::SigningDependent,
             "ROOT-A" => Policy::FilesMustMatch,
-            "HASH-A" => Policy::Verity,
+            "HASH-A" => Policy::SaltDependent,
             n if n.starts_with("RESERVED") || n.ends_with("-B") => Policy::MustBeZero,
             _ => Policy::MustMatch,
         }
@@ -184,6 +186,17 @@ pub fn hash_range(file: &mut File, offset: u64, len: u64) -> Result<RangeHash> {
     hash_ranges(file, &[(offset, len)])
 }
 
+/// Read `len` bytes at `offset` into memory.
+pub fn read_range(file: &mut File, offset: u64, len: u64) -> Result<Vec<u8>> {
+    ensure_whatever!(len <= 1 << 30, "refusing to read {len} bytes into memory");
+    file.seek(SeekFrom::Start(offset))
+        .whatever_context(format!("failed to seek to {offset}"))?;
+    let mut buf = vec![0u8; len as usize];
+    file.read_exact(&mut buf)
+        .whatever_context(format!("failed to read {len} bytes at {offset}"))?;
+    Ok(buf)
+}
+
 pub fn file_len(file: &File) -> Result<u64> {
     Ok(file
         .metadata()
@@ -279,7 +292,7 @@ pub(crate) mod tests {
         assert_eq!(p("EFI-A").policy(), Policy::SigningDependent);
         assert_eq!(p("BOOT-A").policy(), Policy::SigningDependent);
         assert_eq!(p("ROOT-A").policy(), Policy::FilesMustMatch);
-        assert_eq!(p("HASH-A").policy(), Policy::Verity);
+        assert_eq!(p("HASH-A").policy(), Policy::SaltDependent);
         assert_eq!(p("EFI-B").policy(), Policy::MustBeZero);
         assert_eq!(p("HASH-B").policy(), Policy::MustBeZero);
         assert_eq!(p("RESERVED-A").policy(), Policy::MustBeZero);
