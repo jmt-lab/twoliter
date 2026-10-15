@@ -3923,6 +3923,7 @@ dependencies = [
  "clap",
  "coldsnap",
  "ext4-view",
+ "fatfs",
  "flate2",
  "gptman",
  "hex",

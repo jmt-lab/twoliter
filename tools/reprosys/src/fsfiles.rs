@@ -1,16 +1,40 @@
-//! File-level comparison of root filesystem contents and metadata.
+//! File-level comparison of partitions whose bytes are expected to differ.
+
 use crate::error::Result;
 use crate::kmod;
 use ext4_view::Ext4;
+use fatfs::{FileSystem, FsOptions};
 use regex::bytes::Regex;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
-use snafu::{ensure_whatever, ResultExt};
-use std::collections::BTreeMap;
+use snafu::{ensure_whatever, OptionExt, ResultExt};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{Cursor, Read};
 use std::sync::LazyLock;
+
+/// Signatures and signing certificates, which may differ if both images have them.
+const SIGNING_ARTIFACT_SUFFIXES: &[&str] = &[".sig", ".crt", ".cer", ".der", ".auth", ".esl"];
+
+/// FIPS HMACs of boot files, written by `openssl sha512 -hmac`.
+const HMAC_SUFFIX: &[u8] = b".hmac";
+
+/// The well-known key of the FIPS boot file HMACs.
+const HMAC_KEY: &[u8] = b"FIPS-FTW-RHT2009";
+
+/// The GRUB configuration in BOOT-A, which holds the kernel command line.
+pub const GRUB_CFG: &[u8] = b"/grub/grub.cfg";
+
+/// Where the firmware finds the UKI on the EFI system partition of a UKI image.
+pub const UKI_PATHS: &[&str] = &["/EFI/BOOT/BOOTX64.EFI", "/EFI/BOOT/BOOTAA64.EFI"];
+
+/// Whether `path` is where the firmware finds a UKI. FAT names are case-insensitive.
+pub fn is_uki_path(path: &[u8]) -> bool {
+    UKI_PATHS
+        .iter()
+        .any(|u| path.eq_ignore_ascii_case(u.as_bytes()))
+}
 
 /// The TUF root role, which rebuilds cannot reproduce without the release keys.
 const TUF_ROOT_ROLE: &[u8] = b"/usr/share/updog/root.json";
@@ -21,12 +45,20 @@ const SBOMS: &[&[u8]] = &[
     b"/usr/share/bottlerocket/cyclonedx-sbom.json",
 ];
 
+/// PE sections that only hold embedded keys.
+const KEY_SECTIONS: &[&str] = &[".vendor_cert", ".pubkey"];
+
+/// The PE section of a UKI that holds the kernel command line.
+pub const CMDLINE_SECTION: &str = ".cmdline";
+
 /// Largest file read into memory for a content-aware comparison.
 const MAX_BUFFERED_SIZE: u64 = 256 << 20;
 
 /// Which differences are expected in a filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rules {
+    /// EFI-A and BOOT-A: signing-dependent content.
+    Boot,
     /// ROOT-A: module signatures, the TUF root role and the SBOMs.
     Root,
     /// PRIVATE: none; compared only to explain a difference.
@@ -85,6 +117,174 @@ impl ReadBudget {
     }
 }
 
+/// Read every regular file from a FAT filesystem image.
+pub fn fat_files(partition: Vec<u8>) -> Result<Files> {
+    let mut budget = ReadBudget::new(&partition);
+    let fs = FileSystem::new(Cursor::new(partition), FsOptions::new())
+        .whatever_context("failed to mount FAT filesystem")?;
+    let mut files = Files::new();
+    let mut stack = vec![(String::new(), fs.root_dir())];
+    while let Some((prefix, dir)) = stack.pop() {
+        for entry in dir.iter() {
+            let entry = entry.whatever_context("failed to read FAT directory")?;
+            let name = entry.file_name();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let path = format!("{prefix}/{name}");
+            if entry.is_dir() {
+                stack.push((path, entry.to_dir()));
+            } else {
+                budget.take(&path, entry.len())?;
+                let mut contents = Vec::new();
+                entry
+                    .to_file()
+                    .take(entry.len())
+                    .read_to_end(&mut contents)
+                    .whatever_context(format!("failed to read {path}"))?;
+                insert_unique(&mut files, path.into_bytes(), contents)?;
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// Offset of the primary ext4 superblock, and the size of every copy.
+const EXT4_SUPERBLOCK: usize = 1024;
+
+/// `s_flags` bits recording the directory hash signedness: EXT2_FLAGS_SIGNED_HASH and
+/// EXT2_FLAGS_UNSIGNED_HASH.
+const EXT4_DIR_HASH_FLAGS: u32 = 0x3;
+
+/// Offset of `s_flags` in an ext4 superblock.
+const EXT4_S_FLAGS: usize = 0x160;
+
+/// Offset of `s_checksum` in an ext4 superblock, which covers the bytes before it.
+const EXT4_S_CHECKSUM: usize = 0x3fc;
+
+fn le_u32(data: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(data[offset..offset + 4].try_into().expect("4 bytes"))
+}
+
+/// The ext4 superblock at `offset` in `partition`.
+fn ext4_superblock(partition: &[u8], offset: usize) -> Result<&[u8]> {
+    let sb = partition
+        .get(offset..offset + EXT4_SUPERBLOCK)
+        .whatever_context("ext4 filesystem is truncated")?;
+    ensure_whatever!(
+        sb[0x38..0x3a] == [0x53, 0xef],
+        "no ext4 superblock at offset {offset}"
+    );
+    Ok(sb)
+}
+
+/// The offsets of the primary superblock and of each backup.
+fn ext4_superblock_offsets(partition: &[u8]) -> Result<Vec<usize>> {
+    let sb = ext4_superblock(partition, EXT4_SUPERBLOCK)?;
+    let (compat, incompat, ro_compat) = (le_u32(sb, 0x5c), le_u32(sb, 0x60), le_u32(sb, 0x64));
+    let log_block_size = le_u32(sb, 0x18);
+    ensure_whatever!(log_block_size <= 6, "invalid ext4 block size");
+    let block_size = 1024u64 << log_block_size;
+    let mut blocks = u64::from(le_u32(sb, 0x4));
+    // INCOMPAT_64BIT
+    if incompat & 0x80 != 0 {
+        blocks |= u64::from(le_u32(sb, 0x150)) << 32;
+    }
+    let first_data_block = u64::from(le_u32(sb, 0x14));
+    let blocks_per_group = u64::from(le_u32(sb, 0x20));
+    ensure_whatever!(blocks_per_group > 0, "invalid ext4 blocks per group");
+    let groups = blocks
+        .saturating_sub(first_data_block)
+        .div_ceil(blocks_per_group);
+    let is_power = |mut g: u64, base: u64| {
+        while g.is_multiple_of(base) {
+            g /= base;
+        }
+        g == 1
+    };
+    let has_backup = |g: u64| {
+        // COMPAT_SPARSE_SUPER2 keeps at most two backups, at the groups it names.
+        if compat & 0x200 != 0 {
+            g == u64::from(le_u32(sb, 0x24c)) || g == u64::from(le_u32(sb, 0x250))
+        // RO_COMPAT_SPARSE_SUPER keeps them in group 1 and powers of 3, 5 and 7.
+        } else if ro_compat & 0x1 != 0 {
+            g == 1 || is_power(g, 3) || is_power(g, 5) || is_power(g, 7)
+        } else {
+            true
+        }
+    };
+    let mut offsets = vec![EXT4_SUPERBLOCK];
+    for g in (1..groups).filter(|g| has_backup(*g)) {
+        let offset = g
+            .checked_mul(blocks_per_group)
+            .and_then(|b| b.checked_add(first_data_block))
+            .and_then(|b| b.checked_mul(block_size))
+            .and_then(|o| usize::try_from(o).ok())
+            .whatever_context("invalid ext4 backup superblock offset")?;
+        ext4_superblock(partition, offset)?;
+        offsets.push(offset);
+    }
+    Ok(offsets)
+}
+
+/// CRC32C without the final inversion, as ext4 checksums use it.
+fn crc32c(mut crc: u32, data: &[u8]) -> u32 {
+    for b in data {
+        crc ^= u32::from(*b);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0x82f6_3b78 & (crc & 1).wrapping_neg());
+        }
+    }
+    crc
+}
+
+fn ext4_superblock_checksum(sb: &[u8]) -> u32 {
+    crc32c(!0, &sb[..EXT4_S_CHECKSUM])
+}
+
+/// The directory hash flags of the primary ext4 superblock.
+pub fn ext4_dir_hash_flags(partition: &[u8]) -> Result<u32> {
+    let sb = ext4_superblock(partition, EXT4_SUPERBLOCK)?;
+    Ok(le_u32(sb, EXT4_S_FLAGS) & EXT4_DIR_HASH_FLAGS)
+}
+
+/// How directory hash flags read in reports.
+pub fn dir_hash_signedness(flags: u32) -> Option<&'static str> {
+    match flags & EXT4_DIR_HASH_FLAGS {
+        0x1 => Some("signed"),
+        0x2 => Some("unsigned"),
+        0x3 => Some("flagged both signed and unsigned"),
+        _ => None,
+    }
+}
+
+/// Give every superblock of `partition`, primary and backups, the directory hash
+/// flags of the superblock at the same offset in `like`. Superblocks with a valid
+/// checksum get the checksum of their new contents, so the result is what a build
+/// host whose `char` has the signedness `like` records writes.
+pub fn ext4_copy_dir_hash_flags(partition: &mut [u8], like: &[u8]) -> Result<()> {
+    let sb = ext4_superblock(partition, EXT4_SUPERBLOCK)?;
+    // RO_COMPAT_METADATA_CSUM
+    let checksummed = le_u32(sb, 0x64) & 0x400 != 0;
+    for offset in ext4_superblock_offsets(partition)? {
+        // Without a superblock there, `like` differs anyway.
+        let Ok(like_sb) = ext4_superblock(like, offset) else {
+            continue;
+        };
+        let flags = le_u32(like_sb, EXT4_S_FLAGS) & EXT4_DIR_HASH_FLAGS;
+        let sb = &mut partition[offset..offset + EXT4_SUPERBLOCK];
+        let valid_checksum =
+            checksummed && ext4_superblock_checksum(sb) == le_u32(sb, EXT4_S_CHECKSUM);
+        let s_flags = (le_u32(sb, EXT4_S_FLAGS) & !EXT4_DIR_HASH_FLAGS) | flags;
+        sb[EXT4_S_FLAGS..EXT4_S_FLAGS + 4].copy_from_slice(&s_flags.to_le_bytes());
+        if valid_checksum {
+            let checksum = ext4_superblock_checksum(sb);
+            sb[EXT4_S_CHECKSUM..].copy_from_slice(&checksum.to_le_bytes());
+        }
+    }
+    Ok(())
+}
+
 /// Read every regular file from an ext4 filesystem image.
 pub fn ext4_files(partition: Vec<u8>) -> Result<Files> {
     let mut budget = ReadBudget::new(&partition);
@@ -137,6 +337,10 @@ pub struct FileReport {
     pub detail: String,
 }
 
+fn is_pe(data: &[u8]) -> bool {
+    data.starts_with(b"MZ")
+}
+
 /// Replace the verity root hash and salt in `data` with placeholders.
 pub fn normalize_verity(data: &[u8]) -> Vec<u8> {
     VERITY_DIGESTS_RE
@@ -150,6 +354,242 @@ fn describe_contents(data: &[u8]) -> String {
         data.len(),
         hex::encode(Sha256::digest(data))
     )
+}
+
+/// Compare a PE binary. Only signatures, key sections and, if `cmdline_checked`,
+/// the verity digests in `.cmdline` may differ.
+fn compare_pe(expected: &[u8], actual: &[u8], cmdline_checked: bool) -> (FileStatus, String) {
+    let (e, a) = match (
+        pcrsys::pe::get_authenticode_hash(expected),
+        pcrsys::pe::get_authenticode_hash(actual),
+    ) {
+        (Ok(e), Ok(a)) if e == a => {
+            return (
+                FileStatus::ExpectedDifference,
+                "signatures differ; Authenticode digests match".to_string(),
+            )
+        }
+        (Ok(e), Ok(a)) => (hex::encode(e), hex::encode(a)),
+        _ => {
+            return (
+                FileStatus::Mismatch,
+                "failed to compute Authenticode digest".to_string(),
+            )
+        }
+    };
+    let sections = differing_sections(expected, actual, cmdline_checked);
+    let (mut status, mut detail) = describe_pe_difference(&sections);
+    if status == FileStatus::ExpectedDifference {
+        let allowed: BTreeSet<_> = sections
+            .iter()
+            .flatten()
+            .map(|s| (s.name.clone(), s.occurrence))
+            .collect();
+        let same_beyond_sections =
+            normalize_pe(expected, &allowed).and_then(|e| Ok(e == normalize_pe(actual, &allowed)?));
+        match same_beyond_sections {
+            Ok(true) => {}
+            Ok(false) => {
+                status = FileStatus::Mismatch;
+                detail = format!("{detail}, but its headers or layout differ too");
+            }
+            Err(e) => {
+                status = FileStatus::Mismatch;
+                detail = format!("{detail}, but its headers could not be compared: {e}");
+            }
+        }
+    }
+    (
+        status,
+        format!("Authenticode digests differ ({e} vs {a}); {detail}"),
+    )
+}
+
+/// A PE section whose contents differ, with why that is expected, if it is.
+#[derive(Debug)]
+struct SectionDifference {
+    name: String,
+    /// Which section of that name this is, counting from 1.
+    occurrence: usize,
+    expected: Option<&'static str>,
+}
+
+impl SectionDifference {
+    fn new(
+        (name, occurrence): &(String, usize),
+        expected: Option<&[u8]>,
+        actual: Option<&[u8]>,
+        cmdline_checked: bool,
+    ) -> Self {
+        let expected = match (expected, actual) {
+            (Some(_), Some(_)) if KEY_SECTIONS.contains(&name.as_str()) => {
+                Some("sections holding embedded keys")
+            }
+            // BOOT-CONFIG checks the rest of the command line.
+            (Some(e), Some(a))
+                if cmdline_checked
+                    && name == CMDLINE_SECTION
+                    && normalize_verity(e) == normalize_verity(a) =>
+            {
+                Some("the verity root hash and salt of the kernel command line")
+            }
+            _ => None,
+        };
+        Self {
+            name: name.clone(),
+            occurrence: *occurrence,
+            expected,
+        }
+    }
+}
+
+/// Classify the section differences of PE files with different Authenticode digests.
+fn describe_pe_difference(sections: &Result<Vec<SectionDifference>>) -> (FileStatus, String) {
+    let names = |sections: &[&SectionDifference]| {
+        sections
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match sections {
+        Ok(sections) if sections.is_empty() => (
+            FileStatus::Mismatch,
+            "no section differs, so the headers do".to_string(),
+        ),
+        Ok(sections) if sections.iter().all(|s| s.expected.is_some()) => {
+            let mut reasons: Vec<(&str, Vec<&SectionDifference>)> = Vec::new();
+            for s in sections {
+                let reason = s.expected.expect("checked above");
+                match reasons.iter_mut().find(|(r, _)| *r == reason) {
+                    Some((_, list)) => list.push(s),
+                    None => reasons.push((reason, vec![s])),
+                }
+            }
+            let reasons: Vec<String> = reasons
+                .iter()
+                .map(|(reason, sections)| format!("{reason} ({})", names(sections)))
+                .collect();
+            (
+                FileStatus::ExpectedDifference,
+                format!("differs only in {}", reasons.join(" and ")),
+            )
+        }
+        Ok(sections) => (
+            FileStatus::Mismatch,
+            format!(
+                "differs in sections {}; only signatures and the sections holding embedded keys \
+                 may differ",
+                names(&sections.iter().collect::<Vec<_>>())
+            ),
+        ),
+        Err(e) => (
+            FileStatus::Mismatch,
+            format!("sections could not be compared: {e}"),
+        ),
+    }
+}
+
+/// Key PE sections by name and occurrence, so same-named sections stay apart.
+fn by_occurrence(sections: Vec<(String, &[u8])>) -> Vec<((String, usize), &[u8])> {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    sections
+        .into_iter()
+        .map(|(name, data)| {
+            let n = seen.entry(name.clone()).or_default();
+            *n += 1;
+            ((name, *n), data)
+        })
+        .collect()
+}
+
+/// The PE sections that differ, including those in only one binary.
+fn differing_sections(
+    expected: &[u8],
+    actual: &[u8],
+    cmdline_checked: bool,
+) -> Result<Vec<SectionDifference>> {
+    let sections = |data, side: &str| -> Result<BTreeMap<_, _>> {
+        let sections = pcrsys::pe::sections(data)
+            .with_whatever_context(|_| format!("failed to read {side} PE sections"))?;
+        Ok(by_occurrence(sections).into_iter().collect())
+    };
+    let expected = sections(expected, "rebuilt")?;
+    let actual = sections(actual, "published")?;
+    let mut keys: Vec<_> = expected.keys().chain(actual.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    Ok(keys
+        .into_iter()
+        .filter(|k| expected.get(*k) != actual.get(*k))
+        .map(|k| {
+            SectionDifference::new(
+                k,
+                expected.get(k).copied(),
+                actual.get(k).copied(),
+                cmdline_checked,
+            )
+        })
+        .collect())
+}
+
+/// `data` without its checksum, signatures, or the `allowed` sections' contents
+/// and virtual sizes.
+fn normalize_pe(data: &[u8], allowed: &BTreeSet<(String, usize)>) -> Result<Vec<u8>> {
+    let u16_at = |at: usize| -> Result<usize> {
+        let b = data
+            .get(at..at + 2)
+            .whatever_context("truncated PE headers")?;
+        Ok(u16::from_le_bytes([b[0], b[1]]).into())
+    };
+    let u32_at = |at: usize| -> Result<usize> {
+        let b = data
+            .get(at..at + 4)
+            .whatever_context("truncated PE headers")?;
+        Ok(u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize)
+    };
+    let mut out = data.to_vec();
+    let clear = |out: &mut Vec<u8>, at: usize, len: usize| -> Result<()> {
+        out.get_mut(at..at.saturating_add(len))
+            .whatever_context("PE field or section beyond the end of the file")?
+            .fill(0);
+        Ok(())
+    };
+
+    let coff = u32_at(0x3c)? + 4;
+    ensure_whatever!(
+        data.get(coff - 4..coff) == Some(b"PE\0\0"),
+        "no PE signature"
+    );
+    let optional = coff + 20;
+    ensure_whatever!(u16_at(optional)? == 0x20b, "not a PE32+ binary");
+    clear(&mut out, optional + 64, 4)?; // CheckSum
+    let certificates = optional + 112 + 4 * 8; // data directory 4
+    let (cert_offset, cert_len) = (u32_at(certificates)?, u32_at(certificates + 4)?);
+    clear(&mut out, certificates, 8)?;
+
+    let names = pcrsys::pe::sections(data).whatever_context("failed to read PE sections")?;
+    let section_table = optional + u16_at(coff + 16)?;
+    ensure_whatever!(
+        names.len() == u16_at(coff + 2)?,
+        "section table and sections disagree"
+    );
+    for (i, (key, _)) in by_occurrence(names).iter().enumerate() {
+        if allowed.contains(key) {
+            let header = section_table + i * 40;
+            clear(&mut out, header + 8, 4)?; // VirtualSize
+            clear(&mut out, u32_at(header + 20)?, u32_at(header + 16)?)?;
+        }
+    }
+    // Signatures differ in length, so remove the certificate table.
+    if cert_len > 0 {
+        let end = cert_offset
+            .checked_add(cert_len)
+            .filter(|end| *end <= out.len())
+            .whatever_context("certificate table beyond the end of the file")?;
+        out.drain(cert_offset..end);
+    }
+    Ok(out)
 }
 
 /// Compare a kernel module, ignoring its appended signature.
@@ -360,6 +800,26 @@ fn compare_file(
         return report(path, FileStatus::Match, "identical");
     }
     match rules {
+        Rules::Boot => {
+            let signing_artifact = SIGNING_ARTIFACT_SUFFIXES
+                .iter()
+                .any(|s| path.to_ascii_lowercase().ends_with(s.as_bytes()));
+            if signing_artifact {
+                return report(path, FileStatus::ExpectedDifference, "signing artifact");
+            }
+            if is_pe(expected) && is_pe(actual) {
+                let (status, detail) = compare_pe(expected, actual, is_uki_path(path));
+                return report(path, status, detail);
+            }
+            // BOOT-CONFIG checks the rest of grub.cfg.
+            if path == GRUB_CFG && normalize_verity(expected) == normalize_verity(actual) {
+                return report(
+                    path,
+                    FileStatus::ExpectedDifference,
+                    "differs only in the verity root hash and salt",
+                );
+            }
+        }
         Rules::Root => {
             if kmod::is_module(path) {
                 let (status, detail) = compare_module(path, expected, actual);
@@ -387,6 +847,88 @@ fn compare_file(
     )
 }
 
+/// HMAC-SHA512 of `data` with `key`, as `openssl sha512 -hmac` computes it.
+fn hmac_sha512(key: &[u8], data: &[u8]) -> [u8; 64] {
+    const BLOCK_SIZE: usize = 128;
+    let mut block = [0u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        block[..64].copy_from_slice(&Sha512::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let pad = |byte: u8| block.map(|b| b ^ byte);
+    let inner = Sha512::new()
+        .chain_update(pad(0x36))
+        .chain_update(data)
+        .finalize();
+    Sha512::new()
+        .chain_update(pad(0x5c))
+        .chain_update(inner)
+        .finalize()
+        .into()
+}
+
+/// Check that a FIPS HMAC, whose key is public, is the HMAC of the published
+/// file it names.
+fn compare_hmac(path: &[u8], expected: &[u8], actual: &[u8], published: &Files) -> FileReport {
+    // `<hex digest>  <path from the partition root>`
+    let parse = |data: &[u8]| -> Option<(String, String)> {
+        let text = std::str::from_utf8(data).ok()?.trim_end_matches('\n');
+        let (digest, target) = text.split_once("  ")?;
+        Some((digest.to_string(), target.to_string()))
+    };
+    let (Some((_, rebuilt_target)), Some((digest, target))) = (parse(expected), parse(actual))
+    else {
+        return report(
+            path,
+            FileStatus::Mismatch,
+            format!(
+                "not an HMAC of the form `<digest>  <path>` ({} vs {})",
+                describe_contents(expected),
+                describe_contents(actual)
+            ),
+        );
+    };
+    if target != rebuilt_target {
+        return report(
+            path,
+            FileStatus::Mismatch,
+            format!("covers {target} instead of {rebuilt_target}"),
+        );
+    }
+    let target_path = format!("/{target}");
+    // FAT names are case-insensitive.
+    let targets: Vec<_> = published
+        .iter()
+        .filter(|(p, _)| p.eq_ignore_ascii_case(target_path.as_bytes()))
+        .collect();
+    let [(_, data)] = targets.as_slice() else {
+        return report(
+            path,
+            FileStatus::Mismatch,
+            format!("the published image has no single {target_path} to check it against"),
+        );
+    };
+    let computed = hex::encode(hmac_sha512(HMAC_KEY, data));
+    if digest.eq_ignore_ascii_case(&computed) && expected == actual {
+        report(path, FileStatus::Match, "identical")
+    } else if digest.eq_ignore_ascii_case(&computed) {
+        report(
+            path,
+            FileStatus::ExpectedDifference,
+            format!("HMAC of the published {target_path}, which differs from the rebuilt one"),
+        )
+    } else {
+        report(
+            path,
+            FileStatus::Mismatch,
+            format!(
+                "is not the HMAC of the published {target_path} ({digest} vs computed {computed})"
+            ),
+        )
+    }
+}
+
 /// Compare all files; identical ones are logged but not returned.
 pub fn compare_files(expected: &Files, actual: &Files, rules: Rules) -> Vec<FileReport> {
     let mut paths: Vec<&FsPath> = expected.keys().chain(actual.keys()).collect();
@@ -399,8 +941,14 @@ pub fn compare_files(expected: &Files, actual: &Files, rules: Rules) -> Vec<File
                 expected.get(p).map(Vec::as_slice),
                 actual.get(p).map(Vec::as_slice),
             );
-            let report = compare_file(p, e, a, rules);
-            report
+            match (e, a) {
+                (Some(e), Some(a))
+                    if rules == Rules::Boot && p.to_ascii_lowercase().ends_with(HMAC_SUFFIX) =>
+                {
+                    compare_hmac(p, e, a, actual)
+                }
+                _ => compare_file(p, e, a, rules),
+            }
         })
         .filter(|r| r.status != FileStatus::Match)
         .collect()
@@ -698,12 +1246,130 @@ pub fn compare_trees<E: FileTree, A: FileTree>(
 pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::Write;
+
+    /// Build a small FAT image containing `files` (paths relative to the root).
+    pub fn fat_image(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut img = Cursor::new(vec![0u8; 1 << 20]);
+        fatfs::format_volume(&mut img, fatfs::FormatVolumeOptions::new()).unwrap();
+        {
+            let fs = FileSystem::new(&mut img, FsOptions::new()).unwrap();
+            for (path, contents) in files {
+                let root = fs.root_dir();
+                let (dirs, name) = path.rsplit_once('/').unwrap_or(("", path));
+                let mut dir = root;
+                for d in dirs.split('/').filter(|d| !d.is_empty()) {
+                    dir = dir.create_dir(d).unwrap();
+                }
+                dir.create_file(name).unwrap().write_all(contents).unwrap();
+            }
+        }
+        img.into_inner()
+    }
 
     fn files(entries: &[(&str, Vec<u8>)]) -> Files {
         entries
             .iter()
             .map(|(p, c)| (p.as_bytes().to_vec(), c.clone()))
             .collect()
+    }
+
+    #[test]
+    #[ignore = "needs mkfs.ext4"]
+    fn finds_ext4_superblocks_like_dumpe2fs() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let fs = dir.path().join("fs");
+        for (options, size) in [
+            (&["-b", "1024"][..], "10M"),
+            (&["-b", "1024"], "60M"),
+            (&["-b", "4096"], "200M"),
+            (&["-b", "1024", "-O", "^sparse_super,^resize_inode"], "30M"),
+            (&["-b", "1024", "-O", "sparse_super2"], "60M"),
+            (&["-b", "1024", "-O", "64bit"], "30M"),
+        ] {
+            let _ = std::fs::remove_file(&fs);
+            let output = Command::new("mkfs.ext4")
+                .arg("-q")
+                .args(options)
+                .arg(&fs)
+                .arg(size)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let output = Command::new("dumpe2fs").arg(&fs).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let block_size: usize = options[1].parse().unwrap();
+            // "  Primary superblock at 1, ..." and "  Backup superblock at 8193, ...".
+            let expected: Vec<usize> = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .filter_map(|l| l.trim().split_once("superblock at "))
+                .map(|(_, rest)| {
+                    let block: usize = rest.split(',').next().unwrap().parse().unwrap();
+                    if block <= 1 {
+                        EXT4_SUPERBLOCK
+                    } else {
+                        block * block_size
+                    }
+                })
+                .collect();
+            let image = std::fs::read(&fs).unwrap();
+            assert_eq!(
+                ext4_superblock_offsets(&image).unwrap(),
+                expected,
+                "{options:?} {size}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs mkfs.ext4"]
+    fn copies_dir_hash_flags_into_every_superblock() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let fs = dir.path().join("fs");
+        let output = Command::new("mkfs.ext4")
+            .args(["-q", "-b", "1024"])
+            .arg(&fs)
+            .arg("30M")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let image = std::fs::read(&fs).unwrap();
+        let offsets = ext4_superblock_offsets(&image).unwrap();
+        assert!(offsets.len() > 2, "{offsets:?}");
+
+        // Each copy of `like` records the opposite signedness.
+        let mut like = image.clone();
+        for offset in &offsets {
+            let s_flags = offset + EXT4_S_FLAGS;
+            like[s_flags] ^= 0x3;
+            let checksum = ext4_superblock_checksum(&like[*offset..offset + EXT4_SUPERBLOCK]);
+            like[offset + EXT4_S_CHECKSUM..offset + EXT4_SUPERBLOCK]
+                .copy_from_slice(&checksum.to_le_bytes());
+        }
+        assert_ne!(
+            ext4_dir_hash_flags(&like).unwrap(),
+            ext4_dir_hash_flags(&image).unwrap()
+        );
+        let mut copied = image.clone();
+        ext4_copy_dir_hash_flags(&mut copied, &like).unwrap();
+        assert!(copied == like);
+
+        // e2fsck accepts the superblock checksums.
+        std::fs::write(&fs, &copied).unwrap();
+        let output = Command::new("e2fsck").arg("-fn").arg(&fs).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[test]
+    fn lists_fat_files() {
+        let img = fat_image(&[("EFI/BOOT/bootx64.efi", b"MZshim"), ("top.txt", b"x")]);
+        let files = fat_files(img).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[&b"/EFI/BOOT/bootx64.efi".to_vec()], b"MZshim");
+        assert_eq!(files[&b"/top.txt".to_vec()], b"x");
     }
 
     #[test]
@@ -716,6 +1382,38 @@ pub(crate) mod tests {
         insert_unique(&mut map, b"/\xfe".to_vec(), 4).unwrap();
         assert_eq!(display(b"/\xff"), display(b"/\xfe"));
         assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn classifies_differences() {
+        let root = "a".repeat(64);
+        let other_root = "b".repeat(64);
+        let grub = |r: &str, s: &str| {
+            format!(
+                "set dm_verity_root=\"root,,,ro,0 8 verity 1 x y 4096 4096 1 1 sha256 {r} {s} 2\""
+            )
+            .into_bytes()
+        };
+        let expected = files(&[
+            ("/same", b"same".to_vec()),
+            ("/grub/grub.cfg", grub(&root, "00")),
+            ("/grub/grub.cfg.sig", b"sig1".to_vec()),
+            ("/other", b"one".to_vec()),
+            ("/only-rebuilt", b"x".to_vec()),
+        ]);
+        let actual = files(&[
+            ("/same", b"same".to_vec()),
+            ("/grub/grub.cfg", grub(&other_root, "11")),
+            ("/grub/grub.cfg.sig", b"sig2".to_vec()),
+            ("/other", b"two".to_vec()),
+        ]);
+        let reports = compare_files(&expected, &actual, Rules::Boot);
+        let status = |p: &str| reports.iter().find(|r| r.path == p).unwrap().status;
+        assert!(reports.iter().all(|r| r.path != "/same"));
+        assert_eq!(status("/grub/grub.cfg"), FileStatus::ExpectedDifference);
+        assert_eq!(status("/grub/grub.cfg.sig"), FileStatus::ExpectedDifference);
+        assert_eq!(status("/other"), FileStatus::Mismatch);
+        assert_eq!(status("/only-rebuilt"), FileStatus::Mismatch);
     }
 
     #[test]
@@ -886,6 +1584,254 @@ pub(crate) mod tests {
         let expected = files(&[(SPDX_SBOM, spdx("1", &[("glibc", "2.41")]))]);
         let actual = files(&[(SPDX_SBOM, spdx("2", &[("glibc", "2.41")]))]);
         let reports = compare_files(&expected, &actual, Rules::Exact);
+        assert_eq!(reports[0].status, FileStatus::Mismatch);
+    }
+
+    #[test]
+    fn only_key_sections_are_expected_pe_differences() {
+        let names = |n: &[&str]| {
+            Ok(n.iter()
+                .map(|s| SectionDifference::new(&(s.to_string(), 1), Some(b"1"), Some(b"2"), true))
+                .collect())
+        };
+        let (status, detail) = describe_pe_difference(&names(&[".vendor_cert"]));
+        assert_eq!(status, FileStatus::ExpectedDifference);
+        assert_eq!(
+            detail,
+            "differs only in sections holding embedded keys (.vendor_cert)"
+        );
+
+        let (status, _) = describe_pe_difference(&names(&[".pubkey"]));
+        assert_eq!(status, FileStatus::ExpectedDifference);
+
+        let (status, detail) = describe_pe_difference(&names(&[".text", ".vendor_cert"]));
+        assert_eq!(status, FileStatus::Mismatch);
+        assert!(detail.contains(".text, .vendor_cert"), "{detail}");
+
+        let (status, detail) = describe_pe_difference(&names(&[]));
+        assert_eq!(status, FileStatus::Mismatch);
+        assert!(detail.contains("headers"), "{detail}");
+
+        let (status, _) =
+            describe_pe_difference(&Err(snafu::FromString::without_source("bad".to_string())));
+
+        // Key sections must be in both binaries.
+        let added = SectionDifference::new(&(".pubkey".to_string(), 1), None, Some(b"2"), true);
+        assert_eq!(added.expected, None);
+        assert_eq!(status, FileStatus::Mismatch);
+    }
+
+    /// A UKI's kernel command line with the given verity root hash and salt.
+    pub fn uki_cmdline(root: &str, salt: &str, extra: &str) -> Vec<u8> {
+        format!(
+            "console=ttyS0 root=/dev/dm-0 rootwait ro{extra} dm-mod.create=\"root,,,ro,0 2400 \
+             verity 1 PARTUUID=0b5e4d1a-0000-4000-8000-000000000001/PARTNROFF=2 \
+             PARTUUID=0b5e4d1a-0000-4000-8000-000000000001/PARTNROFF=3 4096 4096 300 1 sha256 \
+             {root} {salt} 2 restart_on_corruption ignore_zero_blocks\" -- \
+             systemd.log_target=journal-or-kmsg"
+        )
+        .into_bytes()
+    }
+
+    /// A minimal UKI with `.linux` and `.cmdline` sections.
+    pub fn uki(kernel: &[u8], cmdline: &[u8]) -> Vec<u8> {
+        assert!(kernel.len() <= 0x400 && cmdline.len() <= 0x400);
+        let mut pe = vec![0u8; 0xa00];
+        let put32 = |pe: &mut Vec<u8>, at: usize, v: u32| {
+            pe[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        pe[0..2].copy_from_slice(b"MZ");
+        put32(&mut pe, 0x3c, 0x40); // PE header offset
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        pe[0x44..0x46].copy_from_slice(&0x8664u16.to_le_bytes()); // Machine: x86-64
+        pe[0x46..0x48].copy_from_slice(&2u16.to_le_bytes()); // NumberOfSections
+        pe[0x54..0x56].copy_from_slice(&0xf0u16.to_le_bytes()); // SizeOfOptionalHeader
+        pe[0x56..0x58].copy_from_slice(&0x22u16.to_le_bytes()); // Characteristics
+        pe[0x58..0x5a].copy_from_slice(&0x20bu16.to_le_bytes()); // Magic: PE32+
+        put32(&mut pe, 0x78, 0x1000); // SectionAlignment
+        put32(&mut pe, 0x7c, 0x200); // FileAlignment
+        put32(&mut pe, 0x90, 0x4000); // SizeOfImage
+        put32(&mut pe, 0x94, 0x200); // SizeOfHeaders
+        pe[0x9c..0x9e].copy_from_slice(&10u16.to_le_bytes()); // Subsystem: EFI application
+        put32(&mut pe, 0xc4, 16); // NumberOfRvaAndSizes
+
+        // 0x400 bytes in the file and a page in memory per section.
+        for (i, (name, data)) in [(b".linux\0\0", kernel), (b".cmdline", cmdline)]
+            .into_iter()
+            .enumerate()
+        {
+            let header = 0x148 + i * 0x28;
+            let raw_offset = 0x200 + i as u32 * 0x400;
+            pe[header..header + 8].copy_from_slice(name);
+            put32(&mut pe, header + 8, data.len() as u32); // VirtualSize
+            put32(&mut pe, header + 12, 0x1000 * (i as u32 + 1)); // VirtualAddress
+            put32(&mut pe, header + 16, 0x400); // SizeOfRawData
+            put32(&mut pe, header + 20, raw_offset); // PointerToRawData
+            put32(&mut pe, header + 36, 0x40000040); // Characteristics: initialized, readable
+            let offset = raw_offset as usize;
+            pe[offset..offset + data.len()].copy_from_slice(data);
+        }
+        pe
+    }
+
+    #[test]
+    fn uki_may_differ_only_in_the_verity_digests_of_its_command_line() {
+        let (root, other_root) = ("a".repeat(64), "b".repeat(64));
+        let rebuilt = uki(b"kernel", &uki_cmdline(&root, "00", ""));
+        let compare = |published: &[u8]| compare_pe(&rebuilt, published, true);
+        let resalted = uki(b"kernel", &uki_cmdline(&other_root, "11", ""));
+
+        let (status, detail) = compare(&resalted);
+        assert_eq!(status, FileStatus::ExpectedDifference, "{detail}");
+        assert!(
+            detail.ends_with(
+                "differs only in the verity root hash and salt of the kernel command line \
+                 (.cmdline)"
+            ),
+            "{detail}"
+        );
+        // Only for the UKI whose command line BOOT-CONFIG checks.
+        let (status, _) = compare_pe(&rebuilt, &resalted, false);
+        assert_eq!(status, FileStatus::Mismatch);
+
+        // Any other difference in the command line or the kernel is a mismatch.
+        for published in [
+            uki(b"kernel", &uki_cmdline(&other_root, "11", " init=/bin/sh")),
+            uki(b"kernal", &uki_cmdline(&other_root, "11", "")),
+        ] {
+            let (status, detail) = compare(&published);
+            assert_eq!(status, FileStatus::Mismatch, "{detail}");
+        }
+    }
+
+    #[test]
+    fn allowed_section_differences_do_not_hide_header_changes() {
+        let (root, other_root) = ("a".repeat(64), "b".repeat(64));
+        let rebuilt = uki(b"kernel", &uki_cmdline(&root, "00", ""));
+        let resalted = uki(b"kernel", &uki_cmdline(&other_root, "11", ""));
+        // Make the command line section executable, as if code had been put in it.
+        let mut executable = resalted.clone();
+        let characteristics = 0x148 + 0x28 + 36;
+        executable[characteristics..characteristics + 4]
+            .copy_from_slice(&0x60000020u32.to_le_bytes());
+        // Move the entry point.
+        let mut entry = resalted.clone();
+        entry[0x58 + 16..0x58 + 20].copy_from_slice(&0x2000u32.to_le_bytes());
+        for published in [executable, entry] {
+            let (status, detail) = compare_pe(&rebuilt, &published, true);
+            assert_eq!(status, FileStatus::Mismatch, "{detail}");
+            assert!(
+                detail.ends_with("but its headers or layout differ too"),
+                "{detail}"
+            );
+        }
+
+        // A signature appended to only one of them is not a header change.
+        let mut signed = resalted.clone();
+        let certificates = 0x58 + 112 + 4 * 8;
+        let len = signed.len() as u32;
+        signed[certificates..certificates + 4].copy_from_slice(&len.to_le_bytes());
+        signed[certificates + 4..certificates + 8].copy_from_slice(&16u32.to_le_bytes());
+        signed.extend([7u8; 16]);
+        let (status, detail) = compare_pe(&rebuilt, &signed, true);
+        assert_eq!(status, FileStatus::ExpectedDifference, "{detail}");
+    }
+
+    /// An HMAC file as rpm2img writes it for `target`, holding `data`.
+    pub fn hmac_file(target: &str, data: &[u8]) -> Vec<u8> {
+        format!("{}  {target}\n", hex::encode(hmac_sha512(HMAC_KEY, data))).into_bytes()
+    }
+
+    #[test]
+    fn computes_hmac_sha512() {
+        // RFC 4231, test case 2, and a key longer than the block size (test case 6).
+        assert_eq!(
+            hex::encode(hmac_sha512(b"Jefe", b"what do ya want for nothing?")),
+            "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea250554\
+             9758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737"
+        );
+        assert_eq!(
+            hex::encode(hmac_sha512(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f352\
+             6b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598"
+        );
+    }
+
+    #[test]
+    fn hmacs_must_match_the_published_file() {
+        let vmlinuz = |v: &[u8]| ("/vmlinuz", v.to_vec());
+        let hmac = |target: &str, v: &[u8]| ("/.vmlinuz.hmac", hmac_file(target, v));
+        let rebuilt = files(&[vmlinuz(b"MZone"), hmac("vmlinuz", b"MZone")]);
+        let status = |published: &Files| {
+            let reports = compare_files(&rebuilt, published, Rules::Boot);
+            let r = reports.iter().find(|r| r.path == "/.vmlinuz.hmac");
+            let r = r.unwrap_or_else(|| panic!("no HMAC report in {reports:#?}"));
+            (r.status, r.detail.clone())
+        };
+
+        // Checked against the published kernel, which is compared on its own.
+        let (s, detail) = status(&files(&[vmlinuz(b"MZtwo"), hmac("vmlinuz", b"MZtwo")]));
+        assert_eq!(s, FileStatus::ExpectedDifference, "{detail}");
+        let reports = compare_files(&rebuilt, &rebuilt, Rules::Boot);
+        assert!(reports.is_empty(), "{reports:#?}");
+
+        for (published, error) in [
+            (
+                files(&[vmlinuz(b"MZtwo"), hmac("vmlinuz", b"MZone")]),
+                "is not the HMAC of the published /vmlinuz",
+            ),
+            (
+                files(&[vmlinuz(b"MZtwo"), hmac("vmlinux", b"MZtwo")]),
+                "covers vmlinux instead of vmlinuz",
+            ),
+            (
+                files(&[("/.vmlinuz.hmac", b"garbage".to_vec())]),
+                "not an HMAC of the form",
+            ),
+            (
+                files(&[hmac("vmlinuz", b"MZtwo")]),
+                "the published image has no single /vmlinuz",
+            ),
+        ] {
+            let (s, detail) = status(&published);
+            assert_eq!(s, FileStatus::Mismatch, "{detail}");
+            assert!(detail.starts_with(error), "{detail}");
+        }
+    }
+
+    #[test]
+    fn signing_artifacts_must_be_in_both_images() {
+        let rebuilt = files(&[("/EFI/BOOT/db.crt", b"cert1".to_vec())]);
+        let reports = compare_files(
+            &rebuilt,
+            &files(&[("/EFI/BOOT/db.crt", b"cert2".to_vec())]),
+            Rules::Boot,
+        );
+        assert_eq!(reports[0].status, FileStatus::ExpectedDifference);
+        let published = files(&[
+            ("/EFI/BOOT/db.crt", b"cert2".to_vec()),
+            ("/EFI/BOOT/extra.auth", b"x".to_vec()),
+        ]);
+        let reports = compare_files(&rebuilt, &published, Rules::Boot);
+        let extra = reports
+            .iter()
+            .find(|r| r.path == "/EFI/BOOT/extra.auth")
+            .unwrap();
+        assert_eq!(extra.status, FileStatus::Mismatch);
+        let reports = compare_files(&rebuilt, &Files::new(), Rules::Boot);
+        assert_eq!(reports[0].status, FileStatus::Mismatch);
+
+        // Only grub.cfg may differ in its verity digests.
+        let table =
+            |root: &str| format!("verity 1 a b 4096 4096 1 1 sha256 {root} 00").into_bytes();
+        let reports = compare_files(
+            &files(&[("/grub/other.cfg", table(&"a".repeat(64)))]),
+            &files(&[("/grub/other.cfg", table(&"b".repeat(64)))]),
+            Rules::Boot,
+        );
         assert_eq!(reports[0].status, FileStatus::Mismatch);
     }
 

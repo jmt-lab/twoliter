@@ -27,9 +27,9 @@ pub enum Policy {
     FilesMustMatch,
     /// Depends on the random verity salt; not compared.
     SaltDependent,
-    /// Contents depend on signing keys; differences are reported as warnings.
+    /// Files may differ only in signing-dependent content.
     SigningDependent,
-    /// grub.cfg must match, except for the verity root hash and salt.
+    /// The kernel command line must match except for the verity root hash and salt.
     BootConfig,
 }
 
