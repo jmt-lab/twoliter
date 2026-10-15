@@ -1,7 +1,11 @@
-//! File-level comparison of root filesystem contents and metadata.
+//! File-level comparison of partitions whose bytes are expected to differ: the
+//! signing-dependent boot partitions (EFI-A, BOOT-A) and ROOT-A, whose kernel
+//! modules are signed with a per-build key.
+
 use crate::error::Result;
 use crate::kmod;
 use ext4_view::Ext4;
+use fatfs::{FileSystem, FsOptions};
 use regex::bytes::Regex;
 use serde::Serialize;
 use sha2::{Digest, Sha256, Sha512};
@@ -11,9 +15,17 @@ use std::fmt;
 use std::io::{Cursor, Read};
 use std::sync::LazyLock;
 
+/// Files whose contents are produced by signing and are expected to differ.
+const SIGNING_ARTIFACT_SUFFIXES: &[&str] =
+    &[".sig", ".hmac", ".crt", ".cer", ".der", ".auth", ".esl"];
+
 /// The TUF root role updog trusts. Rebuilds generate their own, since the
 /// release root role's keys are not available outside the release process.
 const TUF_ROOT_ROLE: &[u8] = b"/usr/share/updog/root.json";
+
+/// PE sections that only hold embedded keys: shim's vendor certificate and
+/// GRUB's public key for verifying grub.cfg.
+const KEY_SECTIONS: &[&str] = &[".vendor_cert", ".pubkey"];
 
 /// Largest file read into memory to compare it with a content-aware rule
 /// (kernel modules and the TUF root role). Other files are hashed as they are read.
@@ -22,6 +34,9 @@ const MAX_BUFFERED_SIZE: u64 = 256 << 20;
 /// Which differences are expected in a filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rules {
+    /// EFI-A and BOOT-A: signatures, signing certificates, PE binaries that differ
+    /// only in embedded keys, and the verity root hash and salt in grub.cfg.
+    Boot,
     /// ROOT-A: the signatures appended to kernel modules, and the TUF root role.
     Root,
 }
@@ -82,6 +97,38 @@ impl ReadBudget {
     }
 }
 
+/// Read every regular file from a FAT filesystem image.
+pub fn fat_files(partition: Vec<u8>) -> Result<Files> {
+    let mut budget = ReadBudget::new(&partition);
+    let fs = FileSystem::new(Cursor::new(partition), FsOptions::new())
+        .whatever_context("failed to mount FAT filesystem")?;
+    let mut files = Files::new();
+    let mut stack = vec![(String::new(), fs.root_dir())];
+    while let Some((prefix, dir)) = stack.pop() {
+        for entry in dir.iter() {
+            let entry = entry.whatever_context("failed to read FAT directory")?;
+            let name = entry.file_name();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let path = format!("{prefix}/{name}");
+            if entry.is_dir() {
+                stack.push((path, entry.to_dir()));
+            } else {
+                budget.take(&path, entry.len())?;
+                let mut contents = Vec::new();
+                entry
+                    .to_file()
+                    .take(entry.len())
+                    .read_to_end(&mut contents)
+                    .whatever_context(format!("failed to read {path}"))?;
+                insert_unique(&mut files, path.into_bytes(), contents)?;
+            }
+        }
+    }
+    Ok(files)
+}
+
 /// Read every regular file from an ext4 filesystem image.
 pub fn ext4_files(partition: Vec<u8>) -> Result<Files> {
     let mut budget = ReadBudget::new(&partition);
@@ -135,6 +182,10 @@ pub struct FileReport {
     pub detail: String,
 }
 
+fn is_pe(data: &[u8]) -> bool {
+    data.starts_with(b"MZ")
+}
+
 /// Replace the verity root hash and salt in `data` with placeholders.
 pub fn normalize_verity(data: &[u8]) -> Vec<u8> {
     VERITY_DIGESTS_RE
@@ -148,6 +199,90 @@ fn describe_contents(data: &[u8]) -> String {
         data.len(),
         hex::encode(Sha256::digest(data))
     )
+}
+
+/// Compare a PE binary from a signing-dependent partition. Only differences
+/// confined to sections holding embedded keys are expected; any other
+/// difference is reported as a mismatch, with the sections that differ, even
+/// though it may still come from per-build keys embedded in code or data
+/// (the GRUB public key, or the kernel's module signing certificate).
+fn compare_pe(expected: &[u8], actual: &[u8]) -> (FileStatus, String) {
+    let (e, a) = match (
+        pcrsys::pe::get_authenticode_hash(expected),
+        pcrsys::pe::get_authenticode_hash(actual),
+    ) {
+        (Ok(e), Ok(a)) if e == a => {
+            return (
+                FileStatus::ExpectedDifference,
+                "signatures differ; Authenticode digests match".to_string(),
+            )
+        }
+        (Ok(e), Ok(a)) => (hex::encode(e), hex::encode(a)),
+        _ => {
+            return (
+                FileStatus::Mismatch,
+                "failed to compute Authenticode digest".to_string(),
+            )
+        }
+    };
+    let (status, detail) = describe_pe_difference(differing_sections(expected, actual));
+    (
+        status,
+        format!("Authenticode digests differ ({e} vs {a}); {detail}"),
+    )
+}
+
+/// Classify a difference between PE files with different Authenticode
+/// digests, given the names of the sections whose contents differ.
+fn describe_pe_difference(sections: Result<Vec<String>>) -> (FileStatus, String) {
+    match sections {
+        Ok(sections)
+            if !sections.is_empty()
+                && sections.iter().all(|s| KEY_SECTIONS.contains(&s.as_str())) =>
+        {
+            (
+                FileStatus::ExpectedDifference,
+                format!(
+                    "differs only in sections holding embedded keys ({})",
+                    sections.join(", ")
+                ),
+            )
+        }
+        Ok(sections) if sections.is_empty() => (
+            FileStatus::Mismatch,
+            "no section differs, so the headers do".to_string(),
+        ),
+        Ok(sections) => (
+            FileStatus::Mismatch,
+            format!(
+                "differs in sections {}; this may still be caused by per-build keys embedded in \
+                 code or data, such as the GRUB public key or the kernel module signing certificate",
+                sections.join(", ")
+            ),
+        ),
+        Err(e) => (
+            FileStatus::Mismatch,
+            format!("sections could not be compared: {e}"),
+        ),
+    }
+}
+
+/// Names of the PE sections that differ between two binaries, including
+/// sections present in only one of them.
+fn differing_sections(expected: &[u8], actual: &[u8]) -> Result<Vec<String>> {
+    let expected: BTreeMap<_, _> = pcrsys::pe::sections(expected)
+        .whatever_context("failed to read rebuilt PE sections")?
+        .into_iter()
+        .collect();
+    let actual: BTreeMap<_, _> = pcrsys::pe::sections(actual)
+        .whatever_context("failed to read published PE sections")?
+        .into_iter()
+        .collect();
+    let mut names: Vec<_> = expected.keys().chain(actual.keys()).cloned().collect();
+    names.sort();
+    names.dedup();
+    names.retain(|n| expected.get(n) != actual.get(n));
+    Ok(names)
 }
 
 /// Compare a kernel module, ignoring its appended signature.
@@ -251,8 +386,25 @@ fn compare_file(
     actual: Option<&[u8]>,
     rules: Rules,
 ) -> FileReport {
+    let signing_artifact = rules == Rules::Boot
+        && SIGNING_ARTIFACT_SUFFIXES
+            .iter()
+            .any(|s| path.to_ascii_lowercase().ends_with(s.as_bytes()));
+
     let (expected, actual) = match (expected, actual) {
         (Some(e), Some(a)) => (e, a),
+        (None, _) | (_, None) if signing_artifact => {
+            let side = if expected.is_none() {
+                "rebuilt"
+            } else {
+                "published"
+            };
+            return report(
+                path,
+                FileStatus::ExpectedDifference,
+                format!("signing artifact missing from {side} image"),
+            );
+        }
         (None, _) => return report(path, FileStatus::Mismatch, "missing from rebuilt image"),
         (_, None) => return report(path, FileStatus::Mismatch, "missing from published image"),
     };
@@ -261,6 +413,22 @@ fn compare_file(
         return report(path, FileStatus::Match, "identical");
     }
     match rules {
+        Rules::Boot => {
+            if signing_artifact {
+                return report(path, FileStatus::ExpectedDifference, "signing artifact");
+            }
+            if is_pe(expected) && is_pe(actual) {
+                let (status, detail) = compare_pe(expected, actual);
+                return report(path, status, detail);
+            }
+            if normalize_verity(expected) == normalize_verity(actual) {
+                return report(
+                    path,
+                    FileStatus::ExpectedDifference,
+                    "differs only in the verity root hash and salt",
+                );
+            }
+        }
         Rules::Root => {
             if kmod::is_module(path) {
                 let (status, detail) = compare_module(path, expected, actual);
@@ -604,12 +772,41 @@ pub fn compare_trees<E: FileTree, A: FileTree>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::io::Write;
+
+    /// Build a small FAT image containing `files` (paths relative to the root).
+    pub fn fat_image(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut img = Cursor::new(vec![0u8; 1 << 20]);
+        fatfs::format_volume(&mut img, fatfs::FormatVolumeOptions::new()).unwrap();
+        {
+            let fs = FileSystem::new(&mut img, FsOptions::new()).unwrap();
+            for (path, contents) in files {
+                let root = fs.root_dir();
+                let (dirs, name) = path.rsplit_once('/').unwrap_or(("", path));
+                let mut dir = root;
+                for d in dirs.split('/').filter(|d| !d.is_empty()) {
+                    dir = dir.create_dir(d).unwrap();
+                }
+                dir.create_file(name).unwrap().write_all(contents).unwrap();
+            }
+        }
+        img.into_inner()
+    }
 
     fn files(entries: &[(&str, Vec<u8>)]) -> Files {
         entries
             .iter()
             .map(|(p, c)| (p.as_bytes().to_vec(), c.clone()))
             .collect()
+    }
+
+    #[test]
+    fn lists_fat_files() {
+        let img = fat_image(&[("EFI/BOOT/bootx64.efi", b"MZshim"), ("top.txt", b"x")]);
+        let files = fat_files(img).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[&b"/EFI/BOOT/bootx64.efi".to_vec()], b"MZshim");
+        assert_eq!(files[&b"/top.txt".to_vec()], b"x");
     }
 
     #[test]
@@ -622,6 +819,38 @@ pub(crate) mod tests {
         insert_unique(&mut map, b"/\xfe".to_vec(), 4).unwrap();
         assert_eq!(display(b"/\xff"), display(b"/\xfe"));
         assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn classifies_differences() {
+        let root = "a".repeat(64);
+        let other_root = "b".repeat(64);
+        let grub = |r: &str, s: &str| {
+            format!(
+                "set dm_verity_root=\"root,,,ro,0 8 verity 1 x y 4096 4096 1 1 sha256 {r} {s} 2\""
+            )
+            .into_bytes()
+        };
+        let expected = files(&[
+            ("/same", b"same".to_vec()),
+            ("/grub/grub.cfg", grub(&root, "00")),
+            ("/grub/grub.cfg.sig", b"sig1".to_vec()),
+            ("/other", b"one".to_vec()),
+            ("/only-rebuilt", b"x".to_vec()),
+        ]);
+        let actual = files(&[
+            ("/same", b"same".to_vec()),
+            ("/grub/grub.cfg", grub(&other_root, "11")),
+            ("/grub/grub.cfg.sig", b"sig2".to_vec()),
+            ("/other", b"two".to_vec()),
+        ]);
+        let reports = compare_files(&expected, &actual, Rules::Boot);
+        let status = |p: &str| reports.iter().find(|r| r.path == p).unwrap().status;
+        assert!(reports.iter().all(|r| r.path != "/same"));
+        assert_eq!(status("/grub/grub.cfg"), FileStatus::ExpectedDifference);
+        assert_eq!(status("/grub/grub.cfg.sig"), FileStatus::ExpectedDifference);
+        assert_eq!(status("/other"), FileStatus::Mismatch);
+        assert_eq!(status("/only-rebuilt"), FileStatus::Mismatch);
     }
 
     #[test]
@@ -676,6 +905,29 @@ pub(crate) mod tests {
         let actual = files(&[(path, br#"{"signed":{"_type":"targets"}}"#.to_vec())]);
         let reports = compare_files(&expected, &actual, Rules::Root);
         assert_eq!(reports[0].status, FileStatus::Mismatch);
+    }
+
+    #[test]
+    fn only_key_sections_are_expected_pe_differences() {
+        let names = |n: &[&str]| Ok(n.iter().map(|s| s.to_string()).collect());
+        let (status, detail) = describe_pe_difference(names(&[".vendor_cert"]));
+        assert_eq!(status, FileStatus::ExpectedDifference);
+        assert!(detail.starts_with("differs only"), "{detail}");
+
+        let (status, _) = describe_pe_difference(names(&[".pubkey"]));
+        assert_eq!(status, FileStatus::ExpectedDifference);
+
+        let (status, detail) = describe_pe_difference(names(&[".text", ".vendor_cert"]));
+        assert_eq!(status, FileStatus::Mismatch);
+        assert!(detail.contains(".text, .vendor_cert"), "{detail}");
+
+        let (status, detail) = describe_pe_difference(names(&[]));
+        assert_eq!(status, FileStatus::Mismatch);
+        assert!(detail.contains("headers"), "{detail}");
+
+        let (status, _) =
+            describe_pe_difference(Err(snafu::FromString::without_source("bad".to_string())));
+        assert_eq!(status, FileStatus::Mismatch);
     }
 
     #[test]
