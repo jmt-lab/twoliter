@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and salt. EFI-A and BOOT-A fail on any difference other than signatures, signing
   certificates, embedded keys, FIPS HMACs that match their files, and those verity digests.
   A detailed JSON Lines log of every comparison step is kept next to the report.
+* Add `twoliter verify kit`, which rebuilds a published kit from source and compares it against
+  the published kit image. Packages that differ are compared by header and payload, so that
+  per-build kernel module signatures and randomized Go build IDs do not fail verification.
 
 [unreleased]: https://github.com/bottlerocket-os/twoliter/compare/v0.26.0...HEAD
 

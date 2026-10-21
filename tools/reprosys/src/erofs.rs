@@ -9,6 +9,7 @@ use crate::fsfiles::{self, display, Entry, FileTree, FsPath, Kind, Xattrs};
 use regex::bytes::Regex;
 use serde_json::json;
 use snafu::{ensure_whatever, OptionExt, ResultExt};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Permissions};
@@ -480,7 +481,7 @@ fn parse_listing(output: &[u8]) -> Option<Listing> {
 impl FileTree for ErofsTree {
     type Handle = PathBuf;
 
-    fn entries(&self) -> Result<BTreeMap<FsPath, (PathBuf, Entry)>> {
+    fn entries(&self) -> Result<Cow<'_, BTreeMap<FsPath, (PathBuf, Entry)>>> {
         // List the image breadth-first, a level of directories at a time.
         let mut listed = Vec::new();
         let mut level = vec![b"/".to_vec()];
@@ -563,7 +564,7 @@ impl FileTree for ErofsTree {
                 "device_nodes_not_extracted": not_extracted,
             }),
         );
-        Ok(entries)
+        Ok(Cow::Owned(entries))
     }
 
     fn open(&self, handle: &PathBuf) -> Result<Box<dyn Read + '_>> {

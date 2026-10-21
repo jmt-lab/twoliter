@@ -1409,7 +1409,7 @@ mod rootfs_tests {
 
     fn entries(image: &Path) -> BTreeMap<Vec<u8>, fsfiles::Entry> {
         let tree = ErofsTree::extract(image, MIB, 2 * MIB, image.parent().unwrap()).unwrap();
-        let entries = tree.entries().unwrap().into_iter();
+        let entries = tree.entries().unwrap().into_owned().into_iter();
         entries.map(|(path, (_, e))| (path, e)).collect()
     }
 

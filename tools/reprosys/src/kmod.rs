@@ -2,14 +2,19 @@
 
 use crate::error::Result;
 use flate2::read::GzDecoder;
+use liblzma::read::XzDecoder;
+use liblzma::stream::{Stream, CONCATENATED};
 use snafu::{ensure_whatever, ResultExt};
-use std::io::{BufReader, Read, Write};
+use std::borrow::Cow;
+use std::io::Read;
 
 const MODULE_SIG_MAGIC: &[u8] = b"~Module signature appended~\n";
 /// Size of `struct module_signature`, whose last field is the big-endian signature length.
 const MODULE_SIG_INFO_SIZE: usize = 12;
 /// Largest decompressed module accepted, against decompression bombs.
 const MAX_MODULE_SIZE: u64 = 256 << 20;
+/// Most memory the xz decoder may use, which the stream's dictionary size sets.
+const MAX_XZ_MEMORY: u64 = 128 << 20;
 
 /// Whether `path` names a kernel module, compressed or not.
 pub fn is_module(path: &[u8]) -> bool {
@@ -18,12 +23,13 @@ pub fn is_module(path: &[u8]) -> bool {
         .any(|s| path.ends_with(s.as_bytes()))
 }
 
-/// Decompress a module according to its file name.
-pub fn decompress(path: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+/// Decompress a module according to its file name. An uncompressed module is borrowed.
+pub fn decompress<'a>(path: &[u8], data: &'a [u8]) -> Result<Cow<'a, [u8]>> {
     let mut out = Vec::new();
     if path.ends_with(b".xz") {
-        let mut writer = LimitedWriter(&mut out);
-        lzma_rs::xz_decompress(&mut BufReader::new(data), &mut writer)
+        let stream = Stream::new_stream_decoder(MAX_XZ_MEMORY, CONCATENATED)
+            .whatever_context("failed to create an xz decoder")?;
+        read_limited(XzDecoder::new_stream(data, stream), &mut out)
             .whatever_context("failed to decompress xz module")?;
     } else if path.ends_with(b".gz") {
         read_limited(GzDecoder::new(data), &mut out)
@@ -33,9 +39,9 @@ pub fn decompress(path: &[u8], data: &[u8]) -> Result<Vec<u8>> {
             zstd::Decoder::new(data).whatever_context("failed to decompress zstd module")?;
         read_limited(decoder, &mut out).whatever_context("failed to decompress zstd module")?;
     } else {
-        out.extend_from_slice(data);
+        return Ok(Cow::Borrowed(data));
     }
-    Ok(out)
+    Ok(Cow::Owned(out))
 }
 
 fn read_limited<R: Read>(reader: R, out: &mut Vec<u8>) -> std::io::Result<()> {
@@ -44,22 +50,6 @@ fn read_limited<R: Read>(reader: R, out: &mut Vec<u8>) -> std::io::Result<()> {
         return Err(std::io::Error::other("decompressed module is too large"));
     }
     Ok(())
-}
-
-struct LimitedWriter<'a>(&'a mut Vec<u8>);
-
-impl Write for LimitedWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if (self.0.len() + buf.len()) as u64 > MAX_MODULE_SIZE {
-            return Err(std::io::Error::other("decompressed module is too large"));
-        }
-        self.0.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 /// Split a module into its body and signature block, or None if it is unsigned.

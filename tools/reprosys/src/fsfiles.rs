@@ -1,7 +1,11 @@
-//! File-level comparison of partitions whose bytes are expected to differ.
+//! File-level comparison of partitions whose bytes are expected to differ: the
+//! signing-dependent boot partitions (EFI-A, BOOT-A) and ROOT-A, whose kernel
+//! modules are signed with a per-build key. Kit packages are compared the same
+//! way.
 
 use crate::error::Result;
 use crate::eventlog;
+use crate::goelf;
 use crate::kmod;
 use crc::{Algorithm, Crc};
 use ext4_view::Ext4;
@@ -12,6 +16,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256, Sha512};
 use snafu::{ensure_whatever, OptionExt, ResultExt};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{Cursor, Read};
@@ -51,6 +56,10 @@ const SBOMS: &[&[u8]] = &[
 /// PE sections that only hold embedded keys.
 const KEY_SECTIONS: &[&str] = &[".vendor_cert", ".pubkey"];
 
+/// Kernel files built with the module signing key, which each kernel build
+/// generates: the kernel image, which embeds its certificate, and the certificate.
+const SIGNING_KEY_FILES: &[&[u8]] = &[b"/boot/vmlinuz", b"/certs/signing_key.x509"];
+
 /// The PE section of a UKI that holds the kernel command line.
 pub const CMDLINE_SECTION: &str = ".cmdline";
 
@@ -64,8 +73,21 @@ pub enum Rules {
     Boot,
     /// ROOT-A: module signatures, the TUF root role and the SBOMs.
     Root,
+    /// Kit packages: the signatures appended to kernel modules. The kernel
+    /// image and module signing certificate differing is a warning.
+    Kit,
     /// PRIVATE: none; compared only to explain a difference.
     Exact,
+}
+
+impl Rules {
+    /// What the compared files are in, for reports.
+    fn container(self) -> &'static str {
+        match self {
+            Rules::Boot | Rules::Root | Rules::Exact => "image",
+            Rules::Kit => "package",
+        }
+    }
 }
 
 /// The verity root hash and salt in a device-mapper table.
@@ -348,6 +370,7 @@ pub fn ext4_files(partition: Vec<u8>) -> Result<Files> {
 pub enum Status {
     Match,
     ExpectedDifference,
+    Warning,
     Mismatch,
 }
 
@@ -560,12 +583,20 @@ fn normalize_pe(data: &[u8], allowed: &BTreeSet<(String, usize)>) -> Result<Vec<
 }
 
 /// Compare a kernel module, ignoring its appended signature.
-fn compare_module(path: &[u8], expected: &[u8], actual: &[u8]) -> (Status, String) {
-    let unsigned = |data: &[u8]| -> Result<Option<Vec<u8>>> {
-        let module = kmod::decompress(path, data)?;
-        Ok(kmod::split_signature(&module)?.map(|(body, _)| body.to_vec()))
+fn compare_module(path: &[u8], expected: &[u8], actual: &[u8], rules: Rules) -> (Status, String) {
+    let (e_module, a_module) = match (
+        kmod::decompress(path, expected),
+        kmod::decompress(path, actual),
+    ) {
+        (Ok(e), Ok(a)) => (e, a),
+        (Err(e), _) | (_, Err(e)) => {
+            return (Status::Mismatch, format!("failed to read module: {e}"))
+        }
     };
-    match (unsigned(expected), unsigned(actual)) {
+    match (
+        kmod::split_signature(&e_module).map(|s| s.map(|(body, _)| body)),
+        kmod::split_signature(&a_module).map(|s| s.map(|(body, _)| body)),
+    ) {
         (Ok(Some(e)), Ok(Some(a))) if e == a => (
             Status::ExpectedDifference,
             "differs only in the appended module signature".to_string(),
@@ -574,8 +605,8 @@ fn compare_module(path: &[u8], expected: &[u8], actual: &[u8]) -> (Status, Strin
             Status::Mismatch,
             format!(
                 "module differs beyond its signature (unsigned: {} vs {})",
-                ContentDigest::of_slice(&e),
-                ContentDigest::of_slice(&a)
+                ContentDigest::of_slice(e),
+                ContentDigest::of_slice(a)
             ),
         ),
         (Ok(None), Ok(None)) => (
@@ -587,13 +618,14 @@ fn compare_module(path: &[u8], expected: &[u8], actual: &[u8]) -> (Status, Strin
             ),
         ),
         (Ok(e), Ok(a)) => {
-            let side = |m: &Option<Vec<u8>>| if m.is_some() { "signed" } else { "unsigned" };
+            let side = |m: &Option<&[u8]>| if m.is_some() { "signed" } else { "unsigned" };
             (
                 Status::Mismatch,
                 format!(
-                    "module is {} in the rebuilt image but {} in the published image",
+                    "module is {} in the rebuilt {container} but {} in the published {container}",
                     side(&e),
-                    side(&a)
+                    side(&a),
+                    container = rules.container()
                 ),
             )
         }
@@ -796,7 +828,7 @@ fn compare_file(
         }
         Rules::Root => {
             if kmod::is_module(path) {
-                let (status, detail) = compare_module(path, expected, actual);
+                let (status, detail) = compare_module(path, expected, actual, rules);
                 return report(path, status, detail);
             }
             if path.ends_with(TUF_ROOT_ROLE) {
@@ -805,6 +837,38 @@ fn compare_file(
             if is_sbom(path) {
                 let (status, detail) = compare_sbom(expected, actual);
                 return report(path, status, detail);
+            }
+        }
+        Rules::Kit => {
+            if kmod::is_module(path) {
+                let (status, detail) = compare_module(path, expected, actual, rules);
+                return report(path, status, detail);
+            }
+            if SIGNING_KEY_FILES.iter().any(|f| path.ends_with(f)) {
+                return report(
+                    path,
+                    Status::Warning,
+                    format!(
+                        "built with the per-build module signing key, so expected to differ, but \
+                         not checked; contents differ ({} vs {})",
+                        ContentDigest::of_slice(expected),
+                        ContentDigest::of_slice(actual)
+                    ),
+                );
+            }
+            if let Some(result) = goelf::compare_go_binaries(expected, actual) {
+                return match result {
+                    Ok(detail) => report(path, Status::ExpectedDifference, detail),
+                    Err(reason) => report(
+                        path,
+                        Status::Mismatch,
+                        format!(
+                            "Go binary {reason} ({} vs {})",
+                            ContentDigest::of_slice(expected),
+                            ContentDigest::of_slice(actual)
+                        ),
+                    ),
+                };
             }
         }
         Rules::Exact => {}
@@ -1094,10 +1158,12 @@ impl Entry {
 /// A filesystem whose entries can be listed and whose files can be read.
 pub trait FileTree {
     /// What `open` needs to find a file again.
-    type Handle;
+    type Handle: Clone;
 
-    /// Every entry, including the root directory, keyed by absolute path.
-    fn entries(&self) -> Result<BTreeMap<FsPath, (Self::Handle, Entry)>>;
+    /// Every entry, including the root directory, keyed by absolute path. Trees that keep their
+    /// entries lend them.
+    #[allow(clippy::type_complexity)]
+    fn entries(&self) -> Result<Cow<'_, BTreeMap<FsPath, (Self::Handle, Entry)>>>;
 
     /// Open a regular file to read its contents.
     fn open(&self, handle: &Self::Handle) -> Result<Box<dyn Read + '_>>;
@@ -1204,8 +1270,11 @@ fn compare_contents<E: FileTree, A: FileTree>(
             ),
         ));
     }
-    let content_aware = rules == Rules::Root
-        && (kmod::is_module(path) || path.ends_with(TUF_ROOT_ROLE) || is_sbom(path));
+    let content_aware = match rules {
+        Rules::Boot | Rules::Exact => false,
+        Rules::Root => kmod::is_module(path) || path.ends_with(TUF_ROOT_ROLE) || is_sbom(path),
+        Rules::Kit => kmod::is_module(path),
+    };
     if content_aware {
         if e_size.max(a_size) > MAX_BUFFERED_SIZE {
             return Ok(report(
@@ -1231,15 +1300,39 @@ fn compare_contents<E: FileTree, A: FileTree>(
     let expected = ContentDigest::of(e_tree.open(e_handle)?, e_size)?;
     let actual = ContentDigest::of(a_tree.open(a_handle)?, a_size)?;
     log_contents(path, "sha256", &expected, &actual);
-    Ok(if expected == actual {
-        report(path, Status::Match, "identical")
-    } else {
-        report(
-            path,
-            Status::Mismatch,
-            format!("contents differ ({expected} vs {actual})"),
+    if expected == actual {
+        return Ok(report(path, Status::Match, "identical"));
+    }
+    // Differing kit files built with the signing key, and Go binaries, which are recognized by
+    // their contents, are compared in memory.
+    let in_memory = rules == Rules::Kit
+        && (SIGNING_KEY_FILES.iter().any(|f| path.ends_with(f))
+            || (starts_with_elf(e_tree.open(e_handle)?)?
+                && starts_with_elf(a_tree.open(a_handle)?)?));
+    if in_memory && e_size.max(a_size) <= MAX_BUFFERED_SIZE {
+        let expected = read_contents(e_tree.open(e_handle)?, e_size)?;
+        let actual = read_contents(a_tree.open(a_handle)?, a_size)?;
+        return Ok(compare_file(path, Some(&expected), Some(&actual), rules));
+    }
+    let detail = if in_memory {
+        format!(
+            "contents differ ({expected} vs {actual}); files larger than {MAX_BUFFERED_SIZE} \
+             bytes are not compared by content"
         )
-    })
+    } else {
+        format!("contents differ ({expected} vs {actual})")
+    };
+    Ok(report(path, Status::Mismatch, detail))
+}
+
+/// Whether a file starts with the ELF magic number.
+fn starts_with_elf(reader: impl Read) -> Result<bool> {
+    let mut magic = Vec::with_capacity(4);
+    reader
+        .take(4)
+        .read_to_end(&mut magic)
+        .whatever_context("failed to read file")?;
+    Ok(goelf::is_elf(&magic))
 }
 
 /// Compare two filesystems entry by entry, apart from timestamps. Identical
@@ -1274,7 +1367,11 @@ pub fn compare_trees<E: FileTree, A: FileTree>(
             }
             (e, _) => {
                 let side = if e.is_none() { "rebuilt" } else { "published" };
-                report(path, Status::Mismatch, format!("missing from {side} image"))
+                report(
+                    path,
+                    Status::Mismatch,
+                    format!("missing from {side} {}", rules.container()),
+                )
             }
         };
         if eventlog::enabled() {
@@ -1875,8 +1972,8 @@ pub(crate) mod tests {
     impl FileTree for MemTree {
         type Handle = Vec<u8>;
 
-        fn entries(&self) -> Result<BTreeMap<FsPath, (Vec<u8>, Entry)>> {
-            Ok(self.0.clone())
+        fn entries(&self) -> Result<Cow<'_, BTreeMap<FsPath, (Vec<u8>, Entry)>>> {
+            Ok(Cow::Borrowed(&self.0))
         }
 
         fn open(&self, handle: &Vec<u8>) -> Result<Box<dyn Read + '_>> {

@@ -105,6 +105,12 @@ Requirements:
   `ec2:DeleteSnapshot`, `ebs:ListSnapshotBlocks`, `ebs:GetSnapshotBlock` and
   `sts:GetCallerIdentity`.
 
+## Verifying a kit
+
+`twoliter verify kit bottlerocket-core-kit 17.3.0` rebuilds a published kit from source and
+compares it against the published kit image. See [Verifying a kit](docs/verify-kit.md) for how
+the kit is rebuilt and which differences are expected.
+
 ## For Maintainers
 
 This section includes information for maintainers about testing and releasing Twoliter.

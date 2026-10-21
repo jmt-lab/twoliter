@@ -202,6 +202,8 @@ echo "=== Installing RPMs ==="
 [[ "${BUILD_ID_TIMESTAMP}" =~ ^[0-9]+$ ]] || \
     { echo "BUILD_ID_TIMESTAMP must be numeric, got '${BUILD_ID_TIMESTAMP}'" >&2; exit 1; }
 INSTALL_TIME="$(date -u -d "@${BUILD_ID_TIMESTAMP}" +%Y-%m-%dT%H:%M:%SZ)"
+# sbomtool uses SOURCE_DATE_EPOCH for the SBOM creation time (and hence document IDs).
+export SOURCE_DATE_EPOCH="${BUILD_ID_TIMESTAMP}"
 rpm -iv --ignorearch --root "${INSTALL_ROOT}" \
     "${PACKAGE_DIR}"/*.rpm
 
@@ -655,9 +657,13 @@ for format in "spdx" "cyclonedx"; do
     image_sbom="${format}-sbom.json"
     image_sbom_path="${OUTPUT_DIR}/${image_sbom}"
     rpm_sbom="${RPM_SBOM_DIR}/variant-rpms-${format}.json"
+    # Sort the kit SBOMs: merge output depends on input order, and find's order is not stable.
+    kit_sboms=()
     if [[ -d "${KIT_SBOMS_DIR}" ]]; then
-        find "${KIT_SBOMS_DIR}" -name "*-${format}.json" -type f \
-            -exec sbomtool merge --output "${image_sbom_path}" "${rpm_sbom}" {} \+
+        mapfile -d '' -t kit_sboms < <(find "${KIT_SBOMS_DIR}" -name "*-${format}.json" -type f -print0 | LC_ALL=C sort -z)
+    fi
+    if [[ ${#kit_sboms[@]} -gt 0 ]]; then
+        sbomtool merge --output "${image_sbom_path}" "${rpm_sbom}" "${kit_sboms[@]}"
     else
         cp "${rpm_sbom}" "${image_sbom_path}"
     fi

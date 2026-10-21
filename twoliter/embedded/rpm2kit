@@ -43,12 +43,14 @@ done
 # tracks BUILD_ID_TIMESTAMP instead of the rpmbuild wall-clock.
 find "${KIT_DIR}/Packages" -mindepth 1 -exec touch -d "@${BUILD_ID_TIMESTAMP}" {} +
 
-createrepo_c "${KIT_DIR}"
+# Record BUILD_ID_TIMESTAMP as repomd.xml's revision and timestamps instead of
+# the wall-clock time.
+createrepo_c --revision "${BUILD_ID_TIMESTAMP}" --set-timestamp-to-revision "${KIT_DIR}"
 dnf --disablerepo '*' --repofrompath "kit,file:///${KIT_DIR}" repoquery
 
-# Normalize the generated repodata files so the kit's repodata-layer tar
-# entries are also deterministic.
-find "${KIT_DIR}/repodata" -mindepth 1 -exec touch -d "@${BUILD_ID_TIMESTAMP}" {} +
+# Normalize the mtimes of the repodata directory and its files, which `tar`
+# archives in the repodata layer.
+find "${KIT_DIR}/repodata" -exec touch -d "@${BUILD_ID_TIMESTAMP}" {} +
 
 WORK_DIR="$(mktemp -d)"
 

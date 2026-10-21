@@ -8,7 +8,9 @@ mod erofs;
 mod error;
 mod eventlog;
 mod fsfiles;
+mod goelf;
 mod kmod;
+mod rpm;
 mod summary;
 mod verity;
 
@@ -21,7 +23,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use tokio::signal::unix::{signal, SignalKind};
 
-/// Exit code of `compare` when the comparison ran but verification failed.
+/// Exit code of `compare` and `compare-rpm` when the comparison ran but verification failed.
 const EXIT_NOT_VERIFIED: u8 = 2;
 
 #[derive(Parser)]
@@ -73,6 +75,22 @@ enum Command {
 
     /// Compare a rebuilt image against a downloaded one
     Compare(CompareArgs),
+
+    /// Compare a rebuilt RPM package against a published one, by header and payload
+    CompareRpm {
+        /// Package rebuilt from source
+        #[arg(long)]
+        expected: PathBuf,
+
+        /// Published package
+        #[arg(long)]
+        actual: PathBuf,
+
+        /// Directory to unpack the payloads in. Defaults to the directory of
+        /// the published package.
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(ClapArgs)]
@@ -227,47 +245,75 @@ fn compare(args: CompareArgs) -> Result<ExitCode> {
     })
 }
 
-async fn run(args: Args) -> Result<ExitCode> {
+fn run(args: Args) -> Result<ExitCode> {
+    // Only the commands that call AWS are asynchronous. The comparisons run without a runtime,
+    // which would start a worker thread per core.
+    let runtime = || tokio::runtime::Runtime::new().whatever_context("failed to start a runtime");
     match args.command {
         Command::Resolve { aws } => {
-            let clients = Clients::new(&aws).await?;
-            print_json(&clients.resolve(&aws.ami_id).await?)?;
+            runtime()?.block_on(async {
+                let clients = Clients::new(&aws).await?;
+                print_json(&clients.resolve(&aws.ami_id).await?)
+            })?;
         }
         Command::Download {
             aws,
             out_dir,
             keep_copies,
         } => {
-            let clients = Clients::new(&aws).await?;
-            let info = clients.resolve(&aws.ami_id).await?;
-            let downloader =
-                download::Downloader::new(clients.ec2, clients.ebs, clients.region, keep_copies);
-            // Delete snapshot copies when interrupted.
-            let mut sigint =
-                signal(SignalKind::interrupt()).whatever_context("failed to handle SIGINT")?;
-            let mut sigterm =
-                signal(SignalKind::terminate()).whatever_context("failed to handle SIGTERM")?;
-            let images = tokio::select! {
-                images = downloader.download(&info, &out_dir) => images?,
-                _ = sigint.recv() => {
-                    downloader.cleanup().await;
-                    snafu::whatever!("interrupted");
-                }
-                _ = sigterm.recv() => {
-                    downloader.cleanup().await;
-                    snafu::whatever!("terminated");
-                }
-            };
-            print_json(&DownloadOutput { ami: info, images })?;
+            runtime()?.block_on(async {
+                let clients = Clients::new(&aws).await?;
+                let info = clients.resolve(&aws.ami_id).await?;
+                let downloader = download::Downloader::new(
+                    clients.ec2,
+                    clients.ebs,
+                    clients.region,
+                    keep_copies,
+                );
+                // Delete snapshot copies when interrupted.
+                let mut sigint =
+                    signal(SignalKind::interrupt()).whatever_context("failed to handle SIGINT")?;
+                let mut sigterm =
+                    signal(SignalKind::terminate()).whatever_context("failed to handle SIGTERM")?;
+                let images = tokio::select! {
+                    images = downloader.download(&info, &out_dir) => images?,
+                    _ = sigint.recv() => {
+                        downloader.cleanup().await;
+                        snafu::whatever!("interrupted");
+                    }
+                    _ = sigterm.recv() => {
+                        downloader.cleanup().await;
+                        snafu::whatever!("terminated");
+                    }
+                };
+                print_json(&DownloadOutput { ami: info, images })
+            })?;
         }
         Command::Compare(args) => return compare(args),
+        Command::CompareRpm {
+            expected,
+            actual,
+            work_dir,
+        } => {
+            let work_dir = work_dir.unwrap_or_else(|| {
+                actual
+                    .parent()
+                    .filter(|d| !d.as_os_str().is_empty())
+                    .unwrap_or(std::path::Path::new("."))
+                    .to_path_buf()
+            });
+            let result = rpm::compare(&expected, &actual, &work_dir);
+            print_json(&result)?;
+            if result.status == fsfiles::Status::Mismatch {
+                return Ok(ExitCode::from(EXIT_NOT_VERIFIED));
+            }
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run(Args::parse()).await {
+fn main() -> ExitCode {
+    match run(Args::parse()) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {}", snafu::Report::from_error(e));

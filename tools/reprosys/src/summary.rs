@@ -16,6 +16,7 @@ impl RegionReport {
         match (self.status, self.fatal) {
             (Status::Match, _) => ("ok", 3),
             (Status::ExpectedDifference, _) => ("note", 2),
+            (Status::Warning, _) => ("warn", 1),
             (Status::Mismatch, true) => ("FAIL", 0),
             (Status::Mismatch, false) => ("warn", 1),
         }

@@ -19,7 +19,7 @@ flate2.workspace = true
 gptman.workspace = true
 hex.workspace = true
 hmac.workspace = true
-lzma-rs.workspace = true
+liblzma.workspace = true
 pcrsys.workspace = true
 regex.workspace = true
 serde = { workspace = true, features = ["derive"] }

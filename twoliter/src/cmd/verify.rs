@@ -12,6 +12,8 @@ use tempfile::TempDir;
 use tokio::process::Command;
 use tracing::{info, warn};
 
+mod kit;
+
 const DEFAULT_REPO: &str = "https://github.com/bottlerocket-os/bottlerocket";
 
 /// The first twoliter release whose builds are expected to be reproducible.
@@ -26,15 +28,23 @@ const REPROSYS_NOT_VERIFIED: i32 = 2;
 /// Lines of the build log shown when the build fails.
 const BUILD_LOG_TAIL: usize = 40;
 
+/// Hex strings at least this long are shortened in the kit summary; the report has them in full.
+const LONG_HASH: usize = 32;
+
+/// Width the kit summary's prose is wrapped to.
+const WRAP_WIDTH: usize = 100;
+
 #[derive(Debug, Parser)]
 pub(crate) enum VerifyCommand {
     Ami(VerifyAmi),
+    Kit(kit::VerifyKit),
 }
 
 impl VerifyCommand {
     pub(crate) async fn run(self) -> Result<()> {
         match self {
             VerifyCommand::Ami(command) => command.run().await,
+            VerifyCommand::Kit(command) => command.run().await,
         }
     }
 }
@@ -337,33 +347,41 @@ async fn read_toml(path: &Path) -> Result<toml::Value> {
         .with_context(|| format!("Unable to parse '{}'", path.display()))
 }
 
-/// Check out the commit the AMI was built from, cloning `repo` first if given.
-async fn prepare_source(dir: &Path, repo: Option<&str>, info: &AmiInfo) -> Result<()> {
-    match repo {
-        Some(repo) => {
-            if dir.exists() {
-                info!("Reusing existing checkout in '{}'", dir.display());
-                git(dir, &["fetch", "--tags", "origin"]).await?;
-            } else {
-                info!("Cloning '{repo}' into '{}'", dir.display());
-                let parent = dir.parent().context("Source directory has no parent")?;
-                let name = dir.file_name().context("Source directory has no name")?;
-                git(parent, &["clone", repo, &name.to_string_lossy()]).await?;
-            }
-        }
-        None => warn!(
-            "Checking out commit {} in '{}'",
-            info.build_id,
-            dir.display()
-        ),
+/// Clone `repo` into `dir`, or fetch it if `dir` is a checkout from an earlier run.
+async fn fetch_source(dir: &Path, repo: &str) -> Result<()> {
+    if dir.exists() {
+        info!("Reusing existing checkout in '{}'", dir.display());
+        git(dir, &["fetch", "--tags", "origin"]).await?;
+    } else {
+        info!("Cloning '{repo}' into '{}'", dir.display());
+        let parent = dir.parent().context("Source directory has no parent")?;
+        let name = dir.file_name().context("Source directory has no name")?;
+        git(parent, &["clone", repo, &name.to_string_lossy()]).await?;
     }
+    Ok(())
+}
 
+async fn ensure_clean(dir: &Path) -> Result<()> {
     let status = git(dir, &["status", "--porcelain", "--untracked-files=no"]).await?;
     ensure!(
         status.is_empty(),
         "Source directory '{}' has uncommitted changes, which would change the build ID",
         dir.display()
     );
+    Ok(())
+}
+
+/// Check out the commit the AMI was built from, cloning `repo` first if given.
+async fn prepare_source(dir: &Path, repo: Option<&str>, info: &AmiInfo) -> Result<()> {
+    match repo {
+        Some(repo) => fetch_source(dir, repo).await?,
+        None => warn!(
+            "Checking out commit {} in '{}'",
+            info.build_id,
+            dir.display()
+        ),
+    }
+    ensure_clean(dir).await?;
 
     let commit = rev_parse(dir, &info.build_id).await.with_context(|| {
         format!(
@@ -411,26 +429,60 @@ async fn read_release_version(dir: &Path) -> Result<String> {
     )
 }
 
-/// Warn when the checkout pins a twoliter that predates reproducible builds.
-async fn check_twoliter_version(dir: &Path) -> Result<()> {
+/// Read the twoliter version the checkout pins, from the `env` table of Makefile.toml as in
+/// Bottlerocket, or a `TWOLITER_VERSION` variable in the Makefile as in kit repositories.
+async fn pinned_twoliter_version(dir: &Path) -> Result<String> {
     let path = dir.join("Makefile.toml");
-    let makefile = read_toml(&path).await?;
-    let pinned = makefile
-        .get("env")
-        .and_then(|env| env.get("TWOLITER_VERSION"))
-        .and_then(|v| v.as_str())
-        .with_context(|| format!("No TWOLITER_VERSION found in '{}'", path.display()))?;
+    if path.exists() {
+        if let Some(version) = read_toml(&path)
+            .await?
+            .get("env")
+            .and_then(|env| env.get("TWOLITER_VERSION"))
+            .and_then(|v| v.as_str())
+        {
+            return Ok(version.to_string());
+        }
+    }
+    let path = dir.join("Makefile");
+    if path.exists() {
+        for line in fs::read_to_string(&path).await?.lines() {
+            let Some(rest) = line.trim().strip_prefix("TWOLITER_VERSION") else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            if let Some(value) = ["?=", ":=", "="]
+                .iter()
+                .find_map(|op| rest.strip_prefix(op))
+            {
+                let value = value.split('#').next().unwrap_or_default();
+                return Ok(value.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    bail!(
+        "No TWOLITER_VERSION found in Makefile.toml or Makefile in '{}'",
+        dir.display()
+    )
+}
+
+/// Warn when the checkout pins a twoliter that predates reproducible builds, and return whether
+/// its builds are expected to be reproducible.
+async fn check_twoliter_version(dir: &Path) -> Result<bool> {
+    let pinned = pinned_twoliter_version(dir).await?;
     match Version::parse(pinned.trim_start_matches('v')) {
         Ok(version) if version >= MIN_REPRODUCIBLE_TWOLITER => {
             info!("Source pins twoliter {version}");
+            Ok(true)
         }
-        _ => warn!(
-            "\n\n!!! The source pins twoliter {pinned}, which predates reproducible builds \
-             (twoliter {MIN_REPRODUCIBLE_TWOLITER}). The rebuilt image is expected to differ \
-             from the AMI. !!!\n"
-        ),
+        _ => {
+            warn!(
+                "\n\n!!! The source pins twoliter {pinned}, which predates reproducible builds \
+                 (twoliter {MIN_REPRODUCIBLE_TWOLITER}). The rebuild is expected to differ from \
+                 what was published. !!!\n"
+            );
+            Ok(false)
+        }
     }
-    Ok(())
 }
 
 /// Whether the variant enables the `erofs-root-partition` image feature, or None if its manifest
@@ -466,48 +518,17 @@ async fn build(
     info: &AmiInfo,
 ) -> Result<Built> {
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(source_dir)
-        .args(["make", "-e"])
+    cmd.args(["make", "-e"])
         .arg(format!("BUILDSYS_VARIANT={}", info.variant))
         .arg("-e")
-        .arg(format!("BUILDSYS_ARCH={}", info.arch))
-        .kill_on_drop(true);
-    match log {
-        Some(log) => {
-            info!(
-                "Building {} {}; this takes a while. Build output is written to '{}'",
-                info.variant,
-                info.arch,
-                log.display()
-            );
-            let file = std::fs::File::create(log)
-                .with_context(|| format!("Unable to create '{}'", log.display()))?;
-            cmd.stdin(Stdio::null())
-                .stdout(file.try_clone()?)
-                .stderr(file);
-        }
-        None => info!(
-            "Building {} {} in '{}'",
-            info.variant,
-            info.arch,
-            source_dir.display()
-        ),
-    }
-    let started = Instant::now();
-    let status = cmd.status().await.context("Unable to run cargo make")?;
-    if !status.success() {
-        if let Some(log) = log {
-            print_log_tail(log).await;
-        }
-        bail!("Building the variant from source failed");
-    }
-    info!(
-        "Built {} {} in {}m {:02}s",
-        info.variant,
-        info.arch,
-        started.elapsed().as_secs() / 60,
-        started.elapsed().as_secs() % 60
-    );
+        .arg(format!("BUILDSYS_ARCH={}", info.arch));
+    run_build(
+        cmd,
+        source_dir,
+        log,
+        &format!("{} {}", info.variant, info.arch),
+    )
+    .await?;
 
     let variant_dir = source_dir
         .join("build/images")
@@ -535,6 +556,50 @@ async fn build(
         os_image,
         data_image,
     })
+}
+
+/// Run the build command `cmd` in `source_dir`, describing what it builds as `what`.
+///
+/// The build output is written to `log` if given, and shown otherwise.
+async fn run_build(
+    mut cmd: Command,
+    source_dir: &Path,
+    log: Option<&Path>,
+    what: &str,
+) -> Result<()> {
+    cmd.current_dir(source_dir).kill_on_drop(true);
+    match log {
+        Some(log) => {
+            info!(
+                "Building {what}; this takes a while. Build output is written to '{}'",
+                log.display()
+            );
+            let file = std::fs::File::create(log)
+                .with_context(|| format!("Unable to create '{}'", log.display()))?;
+            cmd.stdin(Stdio::null())
+                .stdout(file.try_clone()?)
+                .stderr(file);
+        }
+        None => info!("Building {what} in '{}'", source_dir.display()),
+    }
+    let started = Instant::now();
+    let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+    let status = cmd
+        .status()
+        .await
+        .with_context(|| format!("Unable to run {program}"))?;
+    if !status.success() {
+        if let Some(log) = log {
+            print_log_tail(log).await;
+        }
+        bail!("Building {what} from source failed");
+    }
+    info!(
+        "Built {what} in {}m {:02}s",
+        started.elapsed().as_secs() / 60,
+        started.elapsed().as_secs() % 60
+    );
+    Ok(())
 }
 
 /// Show the end of a failed build's log, where the error usually is.
@@ -566,6 +631,47 @@ async fn lz4_decompress(input: &Path, output: &Path) -> Result<()> {
         input.display()
     );
     Ok(())
+}
+
+/// Shorten hex strings of at least `LONG_HASH` characters to their first 12.
+fn shorten_hashes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(|c: char| c.is_ascii_hexdigit()) {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let len = rest
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(rest.len());
+        if len >= LONG_HASH {
+            out.push_str(&rest[..12]);
+            out.push('…');
+        } else {
+            out.push_str(&rest[..len]);
+        }
+        rest = &rest[len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Wrap `text` to `WRAP_WIDTH`, indenting continuation lines by `indent` spaces.
+fn wrap(text: &str, indent: usize) -> String {
+    let mut out = String::new();
+    let mut column = indent;
+    for word in text.split_whitespace() {
+        if column > indent && column + 1 + word.len() > WRAP_WIDTH {
+            out.push('\n');
+            out.push_str(&" ".repeat(indent));
+            column = indent;
+        } else if column > indent {
+            out.push(' ');
+            column += 1;
+        }
+        out.push_str(word);
+        column += word.chars().count();
+    }
+    out
 }
 
 #[cfg(all(test, target_os = "linux"))]
